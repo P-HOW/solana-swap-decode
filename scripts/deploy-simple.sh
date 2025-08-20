@@ -4,11 +4,20 @@ set -euo pipefail
 ARCHIVE="$1"          # /home/azureuser/txparser-amd64.tar
 LIVE_PORT="${2:-8080}"
 
+# ensure docker daemon is up
+if ! systemctl is-active --quiet docker 2>/dev/null; then
+  systemctl start docker 2>/dev/null || service docker start 2>/dev/null || true
+fi
+
 echo "==> docker load"
 docker load -i "$ARCHIVE" >/dev/null
 
-# get image name:tag from archive
-REF=$(docker image ls --format '{{.Repository}}:{{.Tag}}' | grep txparser-local | head -n1)
+# discover the just-loaded image (repo:tag)
+REF=$(docker image ls --format '{{.Repository}}:{{.Tag}}' | grep -E '^txparser-local:' | head -n1)
+if [[ -z "${REF}" ]]; then
+  echo "ERROR: cannot find loaded txparser-local image"
+  exit 1
+fi
 echo "Using image: $REF"
 
 echo "==> Stop & remove old"
