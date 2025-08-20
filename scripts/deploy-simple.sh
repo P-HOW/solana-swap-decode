@@ -1,24 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
-IMAGE="$1"                  # e.g. ghcr.io/yourorg/txparser:<sha>
-PORT_OUT="${2:-8080}"
 
-echo "==> Pull image"
-docker pull "$IMAGE"
+ARCHIVE="$1"          # /home/azureuser/txparser-amd64.tar
+LIVE_PORT="${2:-8080}"
 
-echo "==> Stop old"
+echo "==> docker load"
+docker load -i "$ARCHIVE" >/dev/null
+
+# get image name:tag from archive
+REF=$(docker image ls --format '{{.Repository}}:{{.Tag}}' | grep txparser-local | head -n1)
+echo "Using image: $REF"
+
+echo "==> Stop & remove old"
 docker rm -f txparser >/dev/null 2>&1 || true
 
 echo "==> Run new"
 docker run -d --name txparser \
-  -p 0.0.0.0:${PORT_OUT}:8080 \
+  -p 0.0.0.0:${LIVE_PORT}:8080 \
   --restart unless-stopped \
-  "$IMAGE"
+  "$REF"
 
-echo "==> Wait for health"
+echo "==> Health"
 for i in {1..40}; do
-  if curl -sf "http://127.0.0.1:${PORT_OUT}/healthz" >/dev/null; then break; fi
+  curl -sf "http://127.0.0.1:${LIVE_PORT}/healthz" >/dev/null && break
   sleep 0.25
 done
-
 echo "OK"
