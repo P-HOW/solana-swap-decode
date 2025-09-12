@@ -1,0 +1,13 @@
+version: "3.9"
+services:
+  txparser:
+    build: .                   # or: image: txparser-local:${TAG:-dev}
+    image: txparser-local:dev  # local tag to avoid clashing with VM tags
+    ports:
+      - "127.0.0.1:${LOCAL_TEST_PORT:-8080}:8080"
+    environment:
+      # keep whatever your main.go already reads (example vars below)
+      # HELIUS_RPC is just an example; use the same env var your service already expects.
+      - HELIUS_RPC=${HELIUS_RPC}
+      - PORT=8080
+    restart: unless-stopped
