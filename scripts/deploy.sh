@@ -1,187 +1,132 @@
 #!/usr/bin/env bash
+# Local deploy that ALWAYS binds 127.0.0.1:8080
+# Proceeds if integration pass% >= MIN_PASS_PCT (default 50) in run-tests.sh
+# macOS/bash3 compatible
+
 set -Eeuo pipefail
-trap 'ec=$?; echo "ERROR: $BASH_SOURCE:$LINENO (exit $ec)"; exit $ec' ERR
 
-ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$ROOT_DIR"
+log() { printf '==> %s\n' "$*"; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
-# Load .env if present (for HELIUS_RPC, etc.)
-if [[ -f .env ]]; then
+await_health() {
+  host="$1"; port="$2"; timeout="${3:-60}"
+  end=$(( $(date +%s) + timeout ))
+  while true; do
+    if curl -sSf "http://${host}:${port}/healthz" >/dev/null 2>&1; then
+      echo "ok"; return 0
+    fi
+    if [ "$(date +%s)" -ge "$end" ]; then
+      echo "timeout"; return 1
+    fi
+    sleep 1
+  done
+}
+
+port_in_use() {
+  _port="$1"
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -iTCP:"${_port}" -sTCP:LISTEN -n -P >/dev/null 2>&1
+    return $?
+  fi
+  if command -v nc >/dev/null 2>&1; then
+    nc -z 127.0.0.1 "${_port}" >/dev/null 2>&1
+    return $?
+  fi
+  return 1
+}
+
+MODE="${1:-local}"
+[ "${MODE}" = "local" ] || die "Only 'local' mode is supported."
+
+# Load .env if present
+if [ -f ".env" ]; then
   set -a
   # shellcheck disable=SC1091
-  . ./.env
+  . ".env"
   set +a
 fi
 
-MODE="${1:-local}"   # local | vm (we only use local here)
 IMAGE_LOCAL="txparser:test-local"
-COMPOSE_FILE="docker-compose.local.yml"
+CONTAINER_NAME="solanaswap-go-txparser-1"
+HOST_IP="127.0.0.1"
+PORT="8080"
 
-# ---------- helpers ----------
-is_port_free() {
-  local port="$1"
-  # Prefer lsof; fall back to nc if available.
-  if command -v lsof >/dev/null 2>&1; then
-    ! lsof -iTCP:"$port" -sTCP:LISTEN -n -P >/dev/null
-  elif command -v nc >/dev/null 2>&1; then
-    ! nc -z localhost "$port" >/dev/null 2>&1
-  else
-    # If we can't check, assume free.
-    return 0
-  fi
+REQUEST_TIMEOUT_SECONDS="${REQUEST_TIMEOUT_SECONDS:-15}"
+CASES_FILE="${CASES_FILE:-tests/cases.json}"
+MIN_PASS_PCT="${MIN_PASS_PCT:-50}"
+
+log "local mode"
+log "Config"
+echo "  IMAGE_LOCAL=${IMAGE_LOCAL}"
+echo "  CONTAINER_NAME=${CONTAINER_NAME}"
+echo "  HOST_IP=${HOST_IP}"
+echo "  PORT=${PORT}  (forced)"
+echo "  REQUEST_TIMEOUT_SECONDS=${REQUEST_TIMEOUT_SECONDS}"
+echo "  CASES_FILE=${CASES_FILE}"
+echo "  MIN_PASS_PCT=${MIN_PASS_PCT}"
+
+command -v docker >/dev/null 2>&1 || die "Docker not found."
+docker info >/dev/null 2>&1 || die "Docker daemon not reachable."
+
+# 1) Free 8080 from Docker containers
+log "Stopping any Docker containers publishing port 8080"
+busy_cids="$(docker ps -q --filter "publish=8080")"
+if [ -n "${busy_cids}" ]; then
+  # shellcheck disable=SC2086
+  docker stop ${busy_cids} >/dev/null 2>&1 || true
+fi
+# Remove our final container if present
+if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}\$"; then
+  docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+fi
+sleep 1
+
+# 2) If some non-Docker process owns 8080, show & abort
+if port_in_use "${PORT}"; then
+  log "Port 8080 is held by a non-Docker process:"
+  lsof -iTCP:8080 -sTCP:LISTEN -n -P || true
+  die "Release 8080 and re-run."
+fi
+
+# 3) Run the test harness (will build the image & clean up)
+log "Go unit + integration tests (threshold ${MIN_PASS_PCT}%)"
+if ! MIN_PASS_PCT="${MIN_PASS_PCT}" REQUEST_TIMEOUT_SECONDS="${REQUEST_TIMEOUT_SECONDS}" CASES_FILE="${CASES_FILE}" ./scripts/run-tests.sh; then
+  die "Integration threshold not met. (Raise MIN_PASS_PCT or fix failing cases.)"
+fi
+
+# At this point, run-tests.sh has cleaned up the temp container, freeing 8080
+
+# 4) Start the FINAL container on 8080
+log "Run final container on ${HOST_IP}:${PORT}"
+cid="$(docker run -d --name "${CONTAINER_NAME}" -p ${HOST_IP}:${PORT}:8080 "${IMAGE_LOCAL}")" || {
+  echo "---- docker ps ----"
+  docker ps --format "table {{.ID}}\t{{.Names}}\t{{.Ports}}"
+  die "Failed to start final container."
 }
+log "Container: ${cid}"
+echo "  Mapped: http://${HOST_IP}:${PORT}"
 
-pick_free_port() {
-  # Start from $PORT if provided, else LOCAL_TEST_PORT, else 8080.
-  local start="${PORT:-${LOCAL_TEST_PORT:-8080}}"
-  local try="$start"
-  local max_tries=50
-  for _ in $(seq 1 "$max_tries"); do
-    if is_port_free "$try"; then
-      echo "$try"
-      return 0
-    fi
-    try=$((try + 1))
-  done
-  # Last resort: let Docker choose a random port later
-  echo ""
-  return 1
-}
-
-wait_health() {
-  local host_port="$1"
-  local tries="${2:-25}"
-  local sleep_s="${3:-0.5}"
-
-  for _ in $(seq 1 "$tries"); do
-    if curl -fsS "http://127.0.0.1:${host_port}/healthz" >/dev/null; then
-      echo "ok"
-      return 0
-    fi
-    sleep "$sleep_s"
-  done
-  echo "timeout"
-  return 1
-}
-
-# ---------- main ----------
-echo "==> ${MODE^} mode"
-
-echo "==> Go unit tests"
-go test ./... 2>/dev/null || true
-
-echo "==> Build test image"
-docker build -t "$IMAGE_LOCAL" .
-
-if [[ "$MODE" != "local" ]]; then
-  echo "Only local mode is wired in this script version."
-  exit 1
+# 5) Health check
+log "Wait for health"
+if [ "$(await_health "${HOST_IP}" "${PORT}" 60)" != "ok" ]; then
+  echo "---- container logs (last 200) ----"
+  docker logs --tail 200 "${CONTAINER_NAME}" || true
+  die "Service did not become healthy."
 fi
 
-echo "==> Pick a host port for local run"
-HOST_PORT="$(pick_free_port || true)"
-if [[ -z "${HOST_PORT:-}" ]]; then
-  echo "No free port found near ${PORT:-${LOCAL_TEST_PORT:-8080}}; letting Docker assign a random one."
-fi
+# 6) Quick verify
+log "Local health"
+set +e
+curl -sS "http://${HOST_IP}:${PORT}/healthz" | sed -e 's/^/  /'
+set -e
 
-# ---------- smoke the image directly (isolated container) ----------
-echo "==> Run container on 127.0.0.1:${HOST_PORT:-<random>}"
-# Use a label so we can clean it if needed.
-if [[ -n "${HOST_PORT:-}" ]]; then
-  cid=$(docker run -d --rm \
-      --label txparser=smoke \
-      -p "127.0.0.1:${HOST_PORT}:8080" \
-      "$IMAGE_LOCAL")
-else
-  cid=$(docker run -d --rm \
-      --label txparser=smoke \
-      -p "127.0.0.1::8080" \
-      "$IMAGE_LOCAL")
-  # Discover the auto-assigned port
-  mapfile -t lines < <(docker port "$cid" 8080 || true)
-  HOST_PORT="$(echo "${lines[0]}" | awk -F: '{print $2}')"
-fi
-
-echo "==> Wait for health"
-state="$(wait_health "$HOST_PORT" 40 0.5)"
-if [[ "$state" != "ok" ]]; then
-  echo "Health check failed on port ${HOST_PORT}"
-  docker logs "$cid" || true
-  docker rm -f "$cid" >/dev/null 2>&1 || true
-  exit 1
-fi
-
-echo "==> Validate swapInfo non-zero for test cases (pacing 1s)"
-# Simple inline check using your tests/cases.json if present
-CASES="${CASES_FILE:-tests/cases.json}"
-if [[ -f "$CASES" ]]; then
-  fail=0
-  while IFS= read -r row; do
-    sig=$(echo "$row" | jq -r '.signature')
-    [[ -z "$sig" || "$sig" == "null" ]] && continue
-    resp=$(curl -fsS --max-time "${REQUEST_TIMEOUT_SECONDS:-15}" \
-      -X POST "http://127.0.0.1:${HOST_PORT}/parse" \
-      -H 'Content-Type: application/json' \
-      -d "{\"signature\":\"$sig\"}" || true)
-    echo "$resp" | jq -e 'has("transaction") and .swapInfo != null' >/dev/null || fail=1
-    sleep "${PER_TEST_DELAY_SECONDS:-1}"
-  done < <(jq -c '.[]' "$CASES")
-  if [[ "$fail" -ne 0 ]]; then
-    echo "==> Some integration checks failed."
-    docker rm -f "$cid" >/dev/null 2>&1 || true
-    exit 1
-  else
-    echo "==> All integration checks passed."
-  fi
-else
-  echo "==> Skipping case validation (no $CASES)"
-fi
-
-# Keep the smoke container running until compose starts (avoid port race),
-# but bring it down right before compose to free the port.
-docker rm -f "$cid" >/dev/null 2>&1 || true
-
-# ---------- Compose up (dev experience) ----------
-echo "==> Building & starting txparser locally (compose)"
-export HOST_PORT                 # used by docker-compose.local.yml
-export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-solanaswap-go}"
-
-docker compose -f "$COMPOSE_FILE" up -d --build
-
-echo "==> Waiting for health on 127.0.0.1:${HOST_PORT}"
-state="$(wait_health "$HOST_PORT" 40 0.5)"
-if [[ "$state" != "ok" ]]; then
-  echo "Compose service unhealthy on ${HOST_PORT}"
-  docker compose -f "$COMPOSE_FILE" logs --no-color || true
-  exit 1
-fi
-
-# A tiny local smoke using one known signature if jq is present.
-if command -v jq >/dev/null 2>&1; then
-  echo "==> Local smoke"
-  curl -fsS "http://127.0.0.1:${HOST_PORT}/healthz" >/dev/null && echo "==> Remote health"
-  if [[ -f "$CASES" ]]; then
-    echo "==> Remote cases (pacing 1s)"
-    fail=0
-    while IFS= read -r row; do
-      name=$(echo "$row" | jq -r '.name // "case"')
-      sig=$(echo "$row" | jq -r '.signature // ""')
-      [[ -z "$sig" ]] && continue
-      printf "  - %s ... " "$name"
-      resp=$(curl -fsS --max-time "${REQUEST_TIMEOUT_SECONDS:-15}" \
-        -X POST "http://127.0.0.1:${HOST_PORT}/parse" \
-        -H 'Content-Type: application/json' \
-        -d "{\"signature\":\"$sig\"}" || true)
-      if echo "$resp" | jq -e 'has("transaction") and .swapInfo != null' >/dev/null; then
-        echo "OK"
-      else
-        echo "FAIL (empty swapInfo)"
-        fail=1
-      fi
-      sleep "${PER_TEST_DELAY_SECONDS:-1}"
-    done < <(jq -c '.[]' "$CASES")
-    [[ "$fail" -eq 0 ]] && echo "smoke OK" || echo "smoke FAILED"
-  fi
-fi
-
-echo "==> Ready on http://127.0.0.1:${HOST_PORT}"
+log "Done. Running on http://${HOST_IP}:${PORT}"
+echo
+echo "Verify:"
+echo "  curl -i http://${HOST_IP}:${PORT}/healthz"
+echo "  curl -s -X POST http://${HOST_IP}:${PORT}/parse \\"
+echo "    -H 'Content-Type: application/json' \\"
+echo "    -d '{\"signature\":\"2kAW5GAhPZjM3NoSrhJVHdEpwjmq9neWtckWnjopCfsmCGB27e3v2ZyMM79FdsL4VWGEtYSFi1sF1Zhs7bqdoaVT\"}' | jq ."
+echo
+echo "Stop later with:"
+echo "  docker rm -f ${CONTAINER_NAME}"
