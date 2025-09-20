@@ -37,7 +37,6 @@ func NewTransactionParser(tx *rpc.GetTransactionResult) (*Parser, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get transaction: %w", err)
 	}
-
 	return NewTransactionParserFromTransaction(txInfo, tx.Meta)
 }
 
@@ -61,11 +60,9 @@ func NewTransactionParserFromTransaction(tx *solana.Transaction, txMeta *rpc.Tra
 	if err := parser.extractSPLTokenInfo(); err != nil {
 		return nil, fmt.Errorf("failed to extract SPL Token Addresses: %w", err)
 	}
-
 	if err := parser.extractSPLDecimals(); err != nil {
 		return nil, fmt.Errorf("failed to extract SPL decimals: %w", err)
 	}
-
 	return parser, nil
 }
 
@@ -74,6 +71,8 @@ type SwapData struct {
 	Data interface{}
 }
 
+// ParseTransaction now treats Jupiter like a router if it doesn't emit a RouteEvent,
+// so we don't lose the underlying AMM legs.
 func (p *Parser) ParseTransaction() ([]SwapData, error) {
 	var parsedSwaps []SwapData
 
@@ -82,11 +81,17 @@ func (p *Parser) ParseTransaction() ([]SwapData, error) {
 		progID := p.allAccountKeys[outerInstruction.ProgramIDIndex]
 		switch {
 		case progID.Equals(JUPITER_PROGRAM_ID):
-			skip = true
-			parsedSwaps = append(parsedSwaps, p.processJupiterSwaps(i)...)
+			jup := p.processJupiterSwaps(i)
+			if len(jup) > 0 {
+				parsedSwaps = append(parsedSwaps, jup...)
+				skip = true // only skip if we *extracted* something under this Jupiter route
+			}
 		case progID.Equals(MOONSHOT_PROGRAM_ID):
-			skip = true
-			parsedSwaps = append(parsedSwaps, p.processMoonshotSwaps()...)
+			ms := p.processMoonshotSwaps()
+			if len(ms) > 0 {
+				parsedSwaps = append(parsedSwaps, ms...)
+				skip = true
+			}
 		case progID.Equals(BANANA_GUN_PROGRAM_ID) ||
 			progID.Equals(MINTECH_PROGRAM_ID) ||
 			progID.Equals(BLOOM_PROGRAM_ID) ||
@@ -96,14 +101,18 @@ func (p *Parser) ParseTransaction() ([]SwapData, error) {
 				parsedSwaps = append(parsedSwaps, innerSwaps...)
 			}
 		case progID.Equals(OKX_DEX_ROUTER_PROGRAM_ID):
-			skip = true
-			parsedSwaps = append(parsedSwaps, p.processOKXSwaps(i)...)
+			okx := p.processOKXSwaps(i)
+			if len(okx) > 0 {
+				parsedSwaps = append(parsedSwaps, okx...)
+				skip = true
+			}
 		}
 	}
 	if skip {
 		return parsedSwaps, nil
 	}
 
+	// Fallback second pass: direct AMMs as outer instructions
 	for i, outerInstruction := range p.txInfo.Message.Instructions {
 		progID := p.allAccountKeys[outerInstruction.ProgramIDIndex]
 		switch {
@@ -114,20 +123,14 @@ func (p *Parser) ParseTransaction() ([]SwapData, error) {
 			progID.Equals(RAYDIUM_LAUNCHLAB_PROGRAM_ID) ||
 			progID.Equals(solana.MustPublicKeyFromBase58("AP51WLiiqTdbZfgyRMs35PsZpdmLuPDdHYmrB23pEtMU")):
 			parsedSwaps = append(parsedSwaps, p.processRaydSwaps(i)...)
-
 		case progID.Equals(ORCA_PROGRAM_ID):
 			parsedSwaps = append(parsedSwaps, p.processOrcaSwaps(i)...)
-
-		// 👇 Add the DBC program alongside other Meteora ids
 		case progID.Equals(METEORA_PROGRAM_ID) ||
 			progID.Equals(METEORA_POOLS_PROGRAM_ID) ||
-			progID.Equals(METEORA_DLMM_PROGRAM_ID) ||
-			progID.Equals(METEORA_DBC_PROGRAM_ID):
+			progID.Equals(METEORA_DLMM_PROGRAM_ID):
 			parsedSwaps = append(parsedSwaps, p.processMeteoraSwaps(i)...)
-
 		case progID.Equals(PUMPFUN_AMM_PROGRAM_ID):
 			parsedSwaps = append(parsedSwaps, p.processPumpfunAMMSwaps(i)...)
-
 		case progID.Equals(PUMP_FUN_PROGRAM_ID) ||
 			progID.Equals(solana.MustPublicKeyFromBase58("BSfD6SHZigAfDWSjzD5Q41jw8LmKwtmjskPH9XW1mrRW")):
 			parsedSwaps = append(parsedSwaps, p.processPumpfunSwaps(i)...)
@@ -157,16 +160,13 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 		return nil, fmt.Errorf("no swap data provided")
 	}
 
-	swapInfo := &SwapInfo{
-		Signatures: p.txInfo.Signatures,
-	}
+	swapInfo := &SwapInfo{Signatures: p.txInfo.Signatures}
 
 	if p.containsDCAProgram() {
 		swapInfo.Signers = []solana.PublicKey{p.allAccountKeys[2]}
 	} else {
 		swapInfo.Signers = []solana.PublicKey{p.allAccountKeys[0]}
 	}
-	signer := swapInfo.Signers[0].String()
 
 	jupiterSwaps := make([]SwapData, 0)
 	pumpfunSwaps := make([]SwapData, 0)
@@ -183,21 +183,23 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 		}
 	}
 
+	// Preferred: Jupiter event(s)
 	if len(jupiterSwaps) > 0 {
 		jupiterInfo, err := parseJupiterEvents(jupiterSwaps)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse Jupiter events: %w", err)
+		if err == nil {
+			swapInfo.TokenInMint = jupiterInfo.TokenInMint
+			swapInfo.TokenInAmount = jupiterInfo.TokenInAmount
+			swapInfo.TokenInDecimals = jupiterInfo.TokenInDecimals
+			swapInfo.TokenOutMint = jupiterInfo.TokenOutMint
+			swapInfo.TokenOutAmount = jupiterInfo.TokenOutAmount
+			swapInfo.TokenOutDecimals = jupiterInfo.TokenOutDecimals
+			swapInfo.AMMs = jupiterInfo.AMMs
+			return swapInfo, nil
 		}
-		swapInfo.TokenInMint = jupiterInfo.TokenInMint
-		swapInfo.TokenInAmount = jupiterInfo.TokenInAmount
-		swapInfo.TokenInDecimals = jupiterInfo.TokenInDecimals
-		swapInfo.TokenOutMint = jupiterInfo.TokenOutMint
-		swapInfo.TokenOutAmount = jupiterInfo.TokenOutAmount
-		swapInfo.TokenOutDecimals = jupiterInfo.TokenOutDecimals
-		swapInfo.AMMs = jupiterInfo.AMMs
-		return swapInfo, nil
+		// If Jupiter events failed to decode, fall back to aggregating the legs below.
 	}
 
+	// Pump.fun native event
 	if len(pumpfunSwaps) > 0 {
 		switch data := pumpfunSwaps[0].Data.(type) {
 		case *PumpfunTradeEvent:
@@ -224,150 +226,49 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 		}
 	}
 
+	// Aggregate legs (Raydium/Orca/Meteora/Pump.fun AMM etc.)
 	if len(otherSwaps) > 0 {
-		// Build user-owned token accounts
-		userTokenAccounts := make(map[string]bool)
-		for _, b := range p.txMeta.PreTokenBalances {
-			if b.Owner.String() == signer {
-				userTokenAccounts[p.allAccountKeys[b.AccountIndex].String()] = true
-			}
-		}
-		for _, b := range p.txMeta.PostTokenBalances {
-			if b.Owner.String() == signer {
-				userTokenAccounts[p.allAccountKeys[b.AccountIndex].String()] = true
-			}
-		}
-
-		type move struct {
-			mint        string
-			amount      uint64
-			decimals    uint8
-			source      string
-			destination string
-			authority   string
-		}
-		var moves []move
+		var uniqueTokens []TokenTransfer
+		seenTokens := make(map[string]bool)
 
 		for _, sd := range otherSwaps {
-			switch d := sd.Data.(type) {
-			case *TransferData:
-				moves = append(moves, move{
-					mint:        d.Mint,
-					amount:      d.Info.Amount,
-					decimals:    d.Decimals,
-					source:      d.Info.Source,
-					destination: d.Info.Destination,
-					authority:   d.Info.Authority,
-				})
-			case *TransferCheck:
-				amt, err := strconv.ParseUint(d.Info.TokenAmount.Amount, 10, 64)
-				if err != nil {
+			if tr := getTransferFromSwapData(sd); tr != nil && !seenTokens[tr.mint] {
+				uniqueTokens = append(uniqueTokens, *tr)
+				seenTokens[tr.mint] = true
+			}
+		}
+
+		if len(uniqueTokens) >= 2 {
+			inputTransfer := uniqueTokens[0]
+			outputTransfer := uniqueTokens[len(uniqueTokens)-1]
+
+			seenInputs := make(map[string]bool)
+			seenOutputs := make(map[string]bool)
+			var totalInputAmount uint64
+			var totalOutputAmount uint64
+
+			for _, sd := range otherSwaps {
+				tr := getTransferFromSwapData(sd)
+				if tr == nil {
 					continue
 				}
-				moves = append(moves, move{
-					mint:        d.Info.Mint,
-					amount:      amt,
-					decimals:    d.Info.TokenAmount.Decimals,
-					source:      d.Info.Source,
-					destination: d.Info.Destination,
-					authority:   d.Info.Authority,
-				})
+				key := fmt.Sprintf("%d-%s", tr.amount, tr.mint)
+				if tr.mint == inputTransfer.mint && !seenInputs[key] {
+					totalInputAmount += tr.amount
+					seenInputs[key] = true
+				}
+				if tr.mint == outputTransfer.mint && !seenOutputs[key] {
+					totalOutputAmount += tr.amount
+					seenOutputs[key] = true
+				}
 			}
-		}
 
-		inputTotals := make(map[string]uint64)
-		inputDecimals := make(map[string]uint8)
-		for _, m := range moves {
-			if m.mint == "" {
-				continue
-			}
-			if m.authority == signer || userTokenAccounts[m.source] {
-				inputTotals[m.mint] += m.amount
-				if _, ok := inputDecimals[m.mint]; !ok {
-					inputDecimals[m.mint] = m.decimals
-				}
-			}
-		}
-
-		outputTotals := make(map[string]uint64)
-		outputDecimals := make(map[string]uint8)
-		for _, m := range moves {
-			if m.mint == "" {
-				continue
-			}
-			if userTokenAccounts[m.destination] {
-				outputTotals[m.mint] += m.amount
-				if _, ok := outputDecimals[m.mint]; !ok {
-					outputDecimals[m.mint] = m.decimals
-				}
-			}
-		}
-
-		// pick largest by volume
-		var inputMint string
-		var inputAmt uint64
-		for mint, amt := range inputTotals {
-			if amt > inputAmt {
-				inputAmt = amt
-				inputMint = mint
-			}
-		}
-		var outputMint string
-		var outputAmt uint64
-		for mint, amt := range outputTotals {
-			if amt > outputAmt {
-				outputAmt = amt
-				outputMint = mint
-			}
-		}
-
-		// fallback if empty
-		if inputMint == "" || outputMint == "" {
-			var uniqueTokens []TokenTransfer
-			seen := map[string]bool{}
-			for _, sd := range otherSwaps {
-				tt := getTransferFromSwapData(sd)
-				if tt != nil && !seen[tt.mint] {
-					uniqueTokens = append(uniqueTokens, *tt)
-					seen[tt.mint] = true
-				}
-			}
-			if len(uniqueTokens) >= 2 {
-				inputMint = uniqueTokens[0].mint
-				for _, mv := range moves {
-					if mv.mint == inputMint {
-						inputAmt += mv.amount
-					}
-				}
-				outputMint = uniqueTokens[len(uniqueTokens)-1].mint
-				for _, mv := range moves {
-					if mv.mint == outputMint {
-						outputAmt += mv.amount
-					}
-				}
-				if _, ok := inputDecimals[inputMint]; !ok {
-					inputDecimals[inputMint] = p.splDecimalsMap[inputMint]
-				}
-				if _, ok := outputDecimals[outputMint]; !ok {
-					outputDecimals[outputMint] = p.splDecimalsMap[outputMint]
-				}
-			}
-		}
-
-		// correct input amount using signer balance delta for SPL tokens (avoids double-count)
-		if inputMint != "" && inputMint != NATIVE_SOL_MINT_PROGRAM_ID.String() {
-			if d, err := p.getTokenBalanceChanges(solana.MustPublicKeyFromBase58(inputMint)); err == nil {
-				inputAmt = uint64(abs(d))
-			}
-		}
-
-		if inputMint != "" && outputMint != "" {
-			swapInfo.TokenInMint = solana.MustPublicKeyFromBase58(inputMint)
-			swapInfo.TokenInAmount = inputAmt
-			swapInfo.TokenInDecimals = inputDecimals[inputMint]
-			swapInfo.TokenOutMint = solana.MustPublicKeyFromBase58(outputMint)
-			swapInfo.TokenOutAmount = outputAmt
-			swapInfo.TokenOutDecimals = outputDecimals[outputMint]
+			swapInfo.TokenInMint = solana.MustPublicKeyFromBase58(inputTransfer.mint)
+			swapInfo.TokenInAmount = totalInputAmount
+			swapInfo.TokenInDecimals = inputTransfer.decimals
+			swapInfo.TokenOutMint = solana.MustPublicKeyFromBase58(outputTransfer.mint)
+			swapInfo.TokenOutAmount = totalOutputAmount
+			swapInfo.TokenOutDecimals = outputTransfer.decimals
 
 			seenAMMs := make(map[string]bool)
 			for _, sd := range otherSwaps {
@@ -376,6 +277,7 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 					seenAMMs[string(sd.Type)] = true
 				}
 			}
+
 			swapInfo.Timestamp = time.Now()
 			return swapInfo, nil
 		}
@@ -401,6 +303,13 @@ func getTransferFromSwapData(swapData SwapData) *TokenTransfer {
 			mint:     data.Info.Mint,
 			amount:   amt,
 			decimals: data.Info.TokenAmount.Decimals,
+		}
+	case *JupiterSwapEventData:
+		// If a caller ever feeds Jupiter events through the generic path
+		return &TokenTransfer{
+			mint:     data.InputMint.String(),
+			amount:   data.InputAmount,
+			decimals: data.InputMintDecimals,
 		}
 	}
 	return nil
@@ -437,8 +346,7 @@ func (p *Parser) processRouterSwaps(instructionIndex int) []SwapData {
 
 		case (progID.Equals(METEORA_PROGRAM_ID) ||
 			progID.Equals(METEORA_POOLS_PROGRAM_ID) ||
-			progID.Equals(METEORA_DLMM_PROGRAM_ID) ||
-			progID.Equals(METEORA_DBC_PROGRAM_ID)) && !processedProtocols[PROTOCOL_METEORA]:
+			progID.Equals(METEORA_DLMM_PROGRAM_ID)) && !processedProtocols[PROTOCOL_METEORA]:
 			processedProtocols[PROTOCOL_METEORA] = true
 			if meteoraSwaps := p.processMeteoraSwaps(instructionIndex); len(meteoraSwaps) > 0 {
 				swaps = append(swaps, meteoraSwaps...)
@@ -476,6 +384,5 @@ func (p *Parser) getInnerInstructions(index int) []solana.CompiledInstruction {
 			return result
 		}
 	}
-
 	return nil
 }

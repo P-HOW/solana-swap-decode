@@ -23,25 +23,71 @@ type JupiterSwapEventData struct {
 	OutputMintDecimals uint8
 }
 
+// Anchor event discriminator for Jupiter RouteV2 event
 var JupiterRouteEventDiscriminator = [16]byte{228, 69, 165, 46, 81, 203, 154, 29, 64, 198, 205, 232, 38, 8, 113, 226}
 
+// processJupiterSwaps tries 2 paths:
+//  1. Parse the dedicated Jupiter Route event (preferred).
+//  2. Fallback: if the event isn't present, scan the *same inner-instruction set*
+//     and delegate to AMM decoders (Raydium/Orca/Meteora/Pump.fun) like a router.
 func (p *Parser) processJupiterSwaps(instructionIndex int) []SwapData {
 	var swaps []SwapData
+	foundRouteEvent := false
+
+	// Try to capture the explicit RouteV2 event first.
 	for _, innerInstructionSet := range p.txMeta.InnerInstructions {
-		if innerInstructionSet.Index == uint16(instructionIndex) {
-			for _, innerInstruction := range innerInstructionSet.Instructions {
-				if p.isJupiterRouteEventInstruction(p.convertRPCToSolanaInstruction(innerInstruction)) {
-					eventData, err := p.parseJupiterRouteEventInstruction(p.convertRPCToSolanaInstruction(innerInstruction))
-					if err != nil {
-						p.Log.Errorf("error processing Pumpfun trade event: %s", err)
-					}
-					if eventData != nil {
-						swaps = append(swaps, SwapData{Type: JUPITER, Data: eventData})
-					}
+		if innerInstructionSet.Index != uint16(instructionIndex) {
+			continue
+		}
+		for _, innerInstruction := range innerInstructionSet.Instructions {
+			inst := p.convertRPCToSolanaInstruction(innerInstruction)
+			if p.isJupiterRouteEventInstruction(inst) {
+				eventData, err := p.parseJupiterRouteEventInstruction(inst)
+				if err != nil {
+					p.Log.Errorf("error processing Jupiter route event: %s", err)
+					continue
+				}
+				if eventData != nil {
+					foundRouteEvent = true
+					swaps = append(swaps, SwapData{Type: JUPITER, Data: eventData})
 				}
 			}
 		}
 	}
+
+	if foundRouteEvent {
+		return swaps
+	}
+
+	// Fallback router behavior:
+	// Jupiter routed swaps often execute as CPIs to the underlying AMMs.
+	// Reuse our router logic to extract those legs from the same inner set.
+	routerLegs := p.processRouterSwaps(instructionIndex)
+	if len(routerLegs) > 0 {
+		return routerLegs
+	}
+
+	// As a last resort, harvest TokenProgram transfers right under this route.
+	// (This helps when an AMM leg is very custom but still uses standard token transfers.)
+	for _, innerInstructionSet := range p.txMeta.InnerInstructions {
+		if innerInstructionSet.Index != uint16(instructionIndex) {
+			continue
+		}
+		for _, innerInstruction := range innerInstructionSet.Instructions {
+			inst := p.convertRPCToSolanaInstruction(innerInstruction)
+			switch {
+			case p.isTransferCheck(inst):
+				if tr := p.processTransferCheck(inst); tr != nil {
+					swaps = append(swaps, SwapData{Type: UNKNOWN, Data: tr})
+				}
+			case p.isTransfer(inst):
+				if tr := p.processTransfer(inst); tr != nil {
+					swaps = append(swaps, SwapData{Type: UNKNOWN, Data: tr})
+				}
+			}
+		}
+	}
+
 	return swaps
 }
 
@@ -60,8 +106,11 @@ func (p *Parser) parseJupiterRouteEventInstruction(instruction solana.CompiledIn
 	if err != nil {
 		return nil, fmt.Errorf("error decoding instruction data: %s", err)
 	}
-	decoder := ag_binary.NewBorshDecoder(decodedBytes[16:])
+	if len(decodedBytes) < 16 {
+		return nil, fmt.Errorf("jupiter event data too short: %d", len(decodedBytes))
+	}
 
+	decoder := ag_binary.NewBorshDecoder(decodedBytes[16:])
 	jupSwapEvent, err := handleJupiterRouteEvent(decoder)
 	if err != nil {
 		return nil, fmt.Errorf("error decoding jupiter swap event: %s", err)
@@ -71,7 +120,6 @@ func (p *Parser) parseJupiterRouteEventInstruction(instruction solana.CompiledIn
 	if !exists {
 		inputMintDecimals = 0
 	}
-
 	outputMintDecimals, exists := p.splDecimalsMap[jupSwapEvent.OutputMint.String()]
 	if !exists {
 		outputMintDecimals = 0
@@ -92,19 +140,9 @@ func handleJupiterRouteEvent(decoder *ag_binary.Decoder) (*JupiterSwapEvent, err
 	return &event, nil
 }
 
-// extractSPLDecimals builds a map of mint->decimals using both PRE and POST token balances,
-// plus TransferChecked mints (without guessing for plain Transfer opcode 3).
 func (p *Parser) extractSPLDecimals() error {
 	mintToDecimals := make(map[string]uint8)
 
-	// From PRE balances
-	for _, accountInfo := range p.txMeta.PreTokenBalances {
-		if !accountInfo.Mint.IsZero() {
-			mintAddress := accountInfo.Mint.String()
-			mintToDecimals[mintAddress] = uint8(accountInfo.UiTokenAmount.Decimals)
-		}
-	}
-	// From POST balances
 	for _, accountInfo := range p.txMeta.PostTokenBalances {
 		if !accountInfo.Mint.IsZero() {
 			mintAddress := accountInfo.Mint.String()
@@ -113,20 +151,18 @@ func (p *Parser) extractSPLDecimals() error {
 	}
 
 	processInstruction := func(instr solana.CompiledInstruction) {
-		prog := p.allAccountKeys[instr.ProgramIDIndex]
-		if !p.isTokenProgram(prog) {
+		if !p.allAccountKeys[instr.ProgramIDIndex].Equals(solana.TokenProgramID) {
 			return
 		}
-		if len(instr.Data) == 0 {
+		if len(instr.Data) == 0 || (instr.Data[0] != 3 && instr.Data[0] != 12) {
 			return
 		}
-		op := instr.Data[0]
-		// TransferChecked only: accounts = [source, mint, dest, authority, ...]
-		if op == 12 && len(instr.Accounts) >= 2 {
-			mint := p.allAccountKeys[instr.Accounts[1]].String()
-			if _, exists := mintToDecimals[mint]; !exists {
-				mintToDecimals[mint] = 0
-			}
+		if len(instr.Accounts) < 3 {
+			return
+		}
+		mint := p.allAccountKeys[instr.Accounts[1]].String()
+		if _, exists := mintToDecimals[mint]; !exists {
+			mintToDecimals[mint] = 0
 		}
 	}
 
@@ -139,9 +175,9 @@ func (p *Parser) extractSPLDecimals() error {
 		}
 	}
 
-	// Add Native SOL if not present
+	// Native SOL (9 decimals)
 	if _, exists := mintToDecimals[NATIVE_SOL_MINT_PROGRAM_ID.String()]; !exists {
-		mintToDecimals[NATIVE_SOL_MINT_PROGRAM_ID.String()] = 9 // Native SOL has 9 decimal places
+		mintToDecimals[NATIVE_SOL_MINT_PROGRAM_ID.String()] = 9
 	}
 
 	p.splDecimalsMap = mintToDecimals
@@ -190,6 +226,5 @@ func parseJupiterEvents(events []SwapData) (*SwapInfo, error) {
 		TokenOutAmount:   lastSwap.OutputAmount,
 		TokenOutDecimals: lastSwap.OutputMintDecimals,
 	}
-
 	return swapInfo, nil
 }
