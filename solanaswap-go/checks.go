@@ -7,11 +7,16 @@ import (
 	"github.com/mr-tron/base58"
 )
 
+// helper: token program check (Token-2022 inclusive)
+func (p *Parser) isTokenProgram(pk solana.PublicKey) bool {
+	return pk.Equals(solana.TokenProgramID) || pk.Equals(solana.Token2022ProgramID)
+}
+
 // isTransfer checks if the instruction is a token transfer (Raydium, Orca)
 func (p *Parser) isTransfer(instr solana.CompiledInstruction) bool {
 	progID := p.allAccountKeys[instr.ProgramIDIndex]
 
-	if !progID.Equals(solana.TokenProgramID) {
+	if !p.isTokenProgram(progID) {
 		return false
 	}
 
@@ -19,6 +24,7 @@ func (p *Parser) isTransfer(instr solana.CompiledInstruction) bool {
 		return false
 	}
 
+	// SPL Token: Transfer
 	if instr.Data[0] != 3 {
 		return false
 	}
@@ -36,7 +42,7 @@ func (p *Parser) isTransfer(instr solana.CompiledInstruction) bool {
 func (p *Parser) isTransferCheck(instr solana.CompiledInstruction) bool {
 	progID := p.allAccountKeys[instr.ProgramIDIndex]
 
-	if !progID.Equals(solana.TokenProgramID) && !progID.Equals(solana.Token2022ProgramID) {
+	if !p.isTokenProgram(progID) {
 		return false
 	}
 
@@ -44,6 +50,7 @@ func (p *Parser) isTransferCheck(instr solana.CompiledInstruction) bool {
 		return false
 	}
 
+	// SPL Token: TransferChecked
 	if instr.Data[0] != 12 {
 		return false
 	}

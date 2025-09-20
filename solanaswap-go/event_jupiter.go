@@ -92,9 +92,19 @@ func handleJupiterRouteEvent(decoder *ag_binary.Decoder) (*JupiterSwapEvent, err
 	return &event, nil
 }
 
+// extractSPLDecimals builds a map of mint->decimals using both PRE and POST token balances,
+// plus TransferChecked mints (without guessing for plain Transfer opcode 3).
 func (p *Parser) extractSPLDecimals() error {
 	mintToDecimals := make(map[string]uint8)
 
+	// From PRE balances
+	for _, accountInfo := range p.txMeta.PreTokenBalances {
+		if !accountInfo.Mint.IsZero() {
+			mintAddress := accountInfo.Mint.String()
+			mintToDecimals[mintAddress] = uint8(accountInfo.UiTokenAmount.Decimals)
+		}
+	}
+	// From POST balances
 	for _, accountInfo := range p.txMeta.PostTokenBalances {
 		if !accountInfo.Mint.IsZero() {
 			mintAddress := accountInfo.Mint.String()
@@ -103,21 +113,20 @@ func (p *Parser) extractSPLDecimals() error {
 	}
 
 	processInstruction := func(instr solana.CompiledInstruction) {
-		if !p.allAccountKeys[instr.ProgramIDIndex].Equals(solana.TokenProgramID) {
+		prog := p.allAccountKeys[instr.ProgramIDIndex]
+		if !p.isTokenProgram(prog) {
 			return
 		}
-
-		if len(instr.Data) == 0 || (instr.Data[0] != 3 && instr.Data[0] != 12) {
+		if len(instr.Data) == 0 {
 			return
 		}
-
-		if len(instr.Accounts) < 3 {
-			return
-		}
-
-		mint := p.allAccountKeys[instr.Accounts[1]].String()
-		if _, exists := mintToDecimals[mint]; !exists {
-			mintToDecimals[mint] = 0
+		op := instr.Data[0]
+		// TransferChecked only: accounts = [source, mint, dest, authority, ...]
+		if op == 12 && len(instr.Accounts) >= 2 {
+			mint := p.allAccountKeys[instr.Accounts[1]].String()
+			if _, exists := mintToDecimals[mint]; !exists {
+				mintToDecimals[mint] = 0
+			}
 		}
 	}
 
@@ -136,7 +145,6 @@ func (p *Parser) extractSPLDecimals() error {
 	}
 
 	p.splDecimalsMap = mintToDecimals
-
 	return nil
 }
 

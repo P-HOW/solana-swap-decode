@@ -2,6 +2,7 @@ package solanaswapgo
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
@@ -153,33 +154,36 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 		Signatures: p.txInfo.Signatures,
 	}
 
+	// Identify signer (fee payer by default; DCA uses index 2 in your code)
 	if p.containsDCAProgram() {
 		swapInfo.Signers = []solana.PublicKey{p.allAccountKeys[2]}
 	} else {
 		swapInfo.Signers = []solana.PublicKey{p.allAccountKeys[0]}
 	}
+	signer := swapInfo.Signers[0].String()
 
+	// Partition by source
 	jupiterSwaps := make([]SwapData, 0)
 	pumpfunSwaps := make([]SwapData, 0)
 	otherSwaps := make([]SwapData, 0)
 
-	for _, swapData := range swapDatas {
-		switch swapData.Type {
+	for _, sd := range swapDatas {
+		switch sd.Type {
 		case JUPITER:
-			jupiterSwaps = append(jupiterSwaps, swapData)
+			jupiterSwaps = append(jupiterSwaps, sd)
 		case PUMP_FUN:
-			pumpfunSwaps = append(pumpfunSwaps, swapData)
+			pumpfunSwaps = append(pumpfunSwaps, sd)
 		default:
-			otherSwaps = append(otherSwaps, swapData)
+			otherSwaps = append(otherSwaps, sd)
 		}
 	}
 
+	// 1) Jupiter: already authoritative
 	if len(jupiterSwaps) > 0 {
 		jupiterInfo, err := parseJupiterEvents(jupiterSwaps)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse Jupiter events: %w", err)
 		}
-
 		swapInfo.TokenInMint = jupiterInfo.TokenInMint
 		swapInfo.TokenInAmount = jupiterInfo.TokenInAmount
 		swapInfo.TokenInDecimals = jupiterInfo.TokenInDecimals
@@ -187,10 +191,10 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 		swapInfo.TokenOutAmount = jupiterInfo.TokenOutAmount
 		swapInfo.TokenOutDecimals = jupiterInfo.TokenOutDecimals
 		swapInfo.AMMs = jupiterInfo.AMMs
-
 		return swapInfo, nil
 	}
 
+	// 2) Pump.fun route event has full details
 	if len(pumpfunSwaps) > 0 {
 		switch data := pumpfunSwaps[0].Data.(type) {
 		case *PumpfunTradeEvent:
@@ -217,59 +221,190 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 		}
 	}
 
+	// 3) Generic AMMs (Meteora/Raydium/Orca/OKX-routed, etc.)
 	if len(otherSwaps) > 0 {
-		var uniqueTokens []TokenTransfer
-		seenTokens := make(map[string]bool)
-
-		for _, swapData := range otherSwaps {
-			transfer := getTransferFromSwapData(swapData)
-			if transfer != nil && !seenTokens[transfer.mint] {
-				uniqueTokens = append(uniqueTokens, *transfer)
-				seenTokens[transfer.mint] = true
+		// Build set of user-owned SPL token accounts from pre+post balances.
+		userTokenAccounts := make(map[string]bool)
+		for _, b := range p.txMeta.PreTokenBalances {
+			if b.Owner.String() == signer {
+				userTokenAccounts[p.allAccountKeys[b.AccountIndex].String()] = true
+			}
+		}
+		for _, b := range p.txMeta.PostTokenBalances {
+			if b.Owner.String() == signer {
+				userTokenAccounts[p.allAccountKeys[b.AccountIndex].String()] = true
 			}
 		}
 
-		if len(uniqueTokens) >= 2 {
-			inputTransfer := uniqueTokens[0]
-			outputTransfer := uniqueTokens[len(uniqueTokens)-1]
+		type move struct {
+			mint        string
+			amount      uint64
+			decimals    uint8
+			source      string
+			destination string
+			authority   string
+		}
 
-			seenInputs := make(map[string]bool)
-			seenOutputs := make(map[string]bool)
-			var totalInputAmount uint64 = 0
-			var totalOutputAmount uint64 = 0
-
-			for _, swapData := range otherSwaps {
-				transfer := getTransferFromSwapData(swapData)
-				if transfer == nil {
+		var moves []move
+		// Normalize all transfers
+		for _, sd := range otherSwaps {
+			switch d := sd.Data.(type) {
+			case *TransferData:
+				m := move{
+					mint:        d.Mint,
+					amount:      d.Info.Amount,
+					decimals:    d.Decimals,
+					source:      d.Info.Source,
+					destination: d.Info.Destination,
+					authority:   d.Info.Authority,
+				}
+				moves = append(moves, m)
+			case *TransferCheck:
+				amt, err := strconv.ParseUint(d.Info.TokenAmount.Amount, 10, 64)
+				if err != nil {
 					continue
 				}
-
-				amountStr := fmt.Sprintf("%d-%s", transfer.amount, transfer.mint)
-				if transfer.mint == inputTransfer.mint && !seenInputs[amountStr] {
-					totalInputAmount += transfer.amount
-					seenInputs[amountStr] = true
+				m := move{
+					mint:        d.Info.Mint,
+					amount:      amt,
+					decimals:    d.Info.TokenAmount.Decimals,
+					source:      d.Info.Source,
+					destination: d.Info.Destination,
+					authority:   d.Info.Authority,
 				}
-				if transfer.mint == outputTransfer.mint && !seenOutputs[amountStr] {
-					totalOutputAmount += transfer.amount
-					seenOutputs[amountStr] = true
+				moves = append(moves, m)
+			}
+		}
+
+		// Inputs:
+		//   - Prefer transfers AUTHORIZED by signer
+		//   - But also include transfers whose SOURCE is a signer-owned token account
+		//     (router PDAs often act as authority while spending from user's account)
+		inputTotals := make(map[string]uint64)
+		inputDecimals := make(map[string]uint8)
+		for _, m := range moves {
+			if m.mint == "" {
+				continue
+			}
+			if m.authority == signer || userTokenAccounts[m.source] {
+				inputTotals[m.mint] += m.amount
+				if _, ok := inputDecimals[m.mint]; !ok {
+					inputDecimals[m.mint] = m.decimals
 				}
 			}
+		}
 
-			swapInfo.TokenInMint = solana.MustPublicKeyFromBase58(inputTransfer.mint)
-			swapInfo.TokenInAmount = totalInputAmount
-			swapInfo.TokenInDecimals = inputTransfer.decimals
-			swapInfo.TokenOutMint = solana.MustPublicKeyFromBase58(outputTransfer.mint)
-			swapInfo.TokenOutAmount = totalOutputAmount
-			swapInfo.TokenOutDecimals = outputTransfer.decimals
+		// Outputs: transfers CREDITED to signer-owned token accounts
+		outputTotals := make(map[string]uint64)
+		outputDecimals := make(map[string]uint8)
+		for _, m := range moves {
+			if m.mint == "" {
+				continue
+			}
+			if userTokenAccounts[m.destination] {
+				outputTotals[m.mint] += m.amount
+				if _, ok := outputDecimals[m.mint]; !ok {
+					outputDecimals[m.mint] = m.decimals
+				}
+			}
+		}
+
+		// Choose dominant input/output mints (largest volume)
+		var inputMint string
+		var inputAmt uint64
+		for mint, amt := range inputTotals {
+			if amt > inputAmt {
+				inputAmt = amt
+				inputMint = mint
+			}
+		}
+		var outputMint string
+		var outputAmt uint64
+		for mint, amt := range outputTotals {
+			if amt > outputAmt {
+				outputAmt = amt
+				outputMint = mint
+			}
+		}
+
+		// Fallback to old heuristic if needed
+		if inputMint == "" || outputMint == "" {
+			var uniqueTokens []TokenTransfer
+			seenTokens := make(map[string]bool)
+			for _, sd := range otherSwaps {
+				tt := getTransferFromSwapData(sd)
+				if tt != nil && !seenTokens[tt.mint] {
+					uniqueTokens = append(uniqueTokens, *tt)
+					seenTokens[tt.mint] = true
+				}
+			}
+			if len(uniqueTokens) >= 2 {
+				inputMint = uniqueTokens[0].mint
+				for _, mv := range moves {
+					if mv.mint == inputMint {
+						inputAmt += mv.amount
+					}
+				}
+				outputMint = uniqueTokens[len(uniqueTokens)-1].mint
+				for _, mv := range moves {
+					if mv.mint == outputMint {
+						outputAmt += mv.amount
+					}
+				}
+				if _, ok := inputDecimals[inputMint]; !ok {
+					inputDecimals[inputMint] = p.splDecimalsMap[inputMint]
+				}
+				if _, ok := outputDecimals[outputMint]; !ok {
+					outputDecimals[outputMint] = p.splDecimalsMap[outputMint]
+				}
+			}
+		}
+
+		// If still missing, pick any remaining totals
+		if inputMint == "" {
+			type kv struct {
+				k string
+				v uint64
+			}
+			var arr []kv
+			for k, v := range inputTotals {
+				arr = append(arr, kv{k, v})
+			}
+			sort.Slice(arr, func(i, j int) bool { return arr[i].v > arr[j].v })
+			if len(arr) > 0 {
+				inputMint, inputAmt = arr[0].k, arr[0].v
+			}
+		}
+		if outputMint == "" {
+			type kv struct {
+				k string
+				v uint64
+			}
+			var arr []kv
+			for k, v := range outputTotals {
+				arr = append(arr, kv{k, v})
+			}
+			sort.Slice(arr, func(i, j int) bool { return arr[i].v > arr[j].v })
+			if len(arr) > 0 {
+				outputMint, outputAmt = arr[0].k, arr[0].v
+			}
+		}
+
+		if inputMint != "" && outputMint != "" {
+			swapInfo.TokenInMint = solana.MustPublicKeyFromBase58(inputMint)
+			swapInfo.TokenInAmount = inputAmt
+			swapInfo.TokenInDecimals = inputDecimals[inputMint]
+			swapInfo.TokenOutMint = solana.MustPublicKeyFromBase58(outputMint)
+			swapInfo.TokenOutAmount = outputAmt
+			swapInfo.TokenOutDecimals = outputDecimals[outputMint]
 
 			seenAMMs := make(map[string]bool)
-			for _, swapData := range otherSwaps {
-				if !seenAMMs[string(swapData.Type)] {
-					swapInfo.AMMs = append(swapInfo.AMMs, string(swapData.Type))
-					seenAMMs[string(swapData.Type)] = true
+			for _, sd := range otherSwaps {
+				if !seenAMMs[string(sd.Type)] {
+					swapInfo.AMMs = append(swapInfo.AMMs, string(sd.Type))
+					seenAMMs[string(sd.Type)] = true
 				}
 			}
-
 			swapInfo.Timestamp = time.Now()
 			return swapInfo, nil
 		}

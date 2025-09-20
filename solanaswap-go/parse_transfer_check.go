@@ -56,12 +56,15 @@ func (p *Parser) processTransferCheck(instr solana.CompiledInstruction) *Transfe
 	}
 
 	transferData.Info.Source = p.allAccountKeys[instr.Accounts[0]].String()
-	transferData.Info.Destination = p.allAccountKeys[instr.Accounts[2]].String()
 	transferData.Info.Mint = p.allAccountKeys[instr.Accounts[1]].String()
+	transferData.Info.Destination = p.allAccountKeys[instr.Accounts[2]].String()
 	transferData.Info.Authority = p.allAccountKeys[instr.Accounts[3]].String()
 
 	transferData.Info.TokenAmount.Amount = fmt.Sprintf("%d", amount)
-	transferData.Info.TokenAmount.Decimals = p.splDecimalsMap[transferData.Info.Mint]
+	// Prefer authoritative decimals map (works even if we didn't see post balance for this mint)
+	if d, ok := p.splDecimalsMap[transferData.Info.Mint]; ok {
+		transferData.Info.TokenAmount.Decimals = d
+	}
 	uiAmount := float64(amount) / math.Pow10(int(transferData.Info.TokenAmount.Decimals))
 	transferData.Info.TokenAmount.UIAmount = uiAmount
 	transferData.Info.TokenAmount.UIAmountString = strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.9f", uiAmount), "0"), ".")
