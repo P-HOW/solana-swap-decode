@@ -278,8 +278,7 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 
 		// Inputs:
 		//   - Prefer transfers AUTHORIZED by signer
-		//   - But also include transfers whose SOURCE is a signer-owned token account
-		//     (router PDAs often act as authority while spending from user's account)
+		//   - Also include transfers whose SOURCE is a signer-owned token account
 		inputTotals := make(map[string]uint64)
 		inputDecimals := make(map[string]uint8)
 		for _, m := range moves {
@@ -389,6 +388,15 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 				outputMint, outputAmt = arr[0].k, arr[0].v
 			}
 		}
+
+		// >>> NEW: correct input amount using signer balance delta for SPL tokens
+		if inputMint != "" && inputMint != NATIVE_SOL_MINT_PROGRAM_ID.String() {
+			if d, err := p.getTokenBalanceChanges(solana.MustPublicKeyFromBase58(inputMint)); err == nil {
+				// use absolute delta; for input it should be negative (spent)
+				inputAmt = uint64(abs(d))
+			}
+		}
+		// <<<
 
 		if inputMint != "" && outputMint != "" {
 			swapInfo.TokenInMint = solana.MustPublicKeyFromBase58(inputMint)
