@@ -2,7 +2,6 @@ package solanaswapgo
 
 import (
 	"fmt"
-	"sort"
 	"strconv"
 	"time"
 
@@ -115,12 +114,20 @@ func (p *Parser) ParseTransaction() ([]SwapData, error) {
 			progID.Equals(RAYDIUM_LAUNCHLAB_PROGRAM_ID) ||
 			progID.Equals(solana.MustPublicKeyFromBase58("AP51WLiiqTdbZfgyRMs35PsZpdmLuPDdHYmrB23pEtMU")):
 			parsedSwaps = append(parsedSwaps, p.processRaydSwaps(i)...)
+
 		case progID.Equals(ORCA_PROGRAM_ID):
 			parsedSwaps = append(parsedSwaps, p.processOrcaSwaps(i)...)
-		case progID.Equals(METEORA_PROGRAM_ID) || progID.Equals(METEORA_POOLS_PROGRAM_ID) || progID.Equals(METEORA_DLMM_PROGRAM_ID):
+
+		// 👇 Add the DBC program alongside other Meteora ids
+		case progID.Equals(METEORA_PROGRAM_ID) ||
+			progID.Equals(METEORA_POOLS_PROGRAM_ID) ||
+			progID.Equals(METEORA_DLMM_PROGRAM_ID) ||
+			progID.Equals(METEORA_DBC_PROGRAM_ID):
 			parsedSwaps = append(parsedSwaps, p.processMeteoraSwaps(i)...)
+
 		case progID.Equals(PUMPFUN_AMM_PROGRAM_ID):
 			parsedSwaps = append(parsedSwaps, p.processPumpfunAMMSwaps(i)...)
+
 		case progID.Equals(PUMP_FUN_PROGRAM_ID) ||
 			progID.Equals(solana.MustPublicKeyFromBase58("BSfD6SHZigAfDWSjzD5Q41jw8LmKwtmjskPH9XW1mrRW")):
 			parsedSwaps = append(parsedSwaps, p.processPumpfunSwaps(i)...)
@@ -154,7 +161,6 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 		Signatures: p.txInfo.Signatures,
 	}
 
-	// Identify signer (fee payer by default; DCA uses index 2 in your code)
 	if p.containsDCAProgram() {
 		swapInfo.Signers = []solana.PublicKey{p.allAccountKeys[2]}
 	} else {
@@ -162,7 +168,6 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 	}
 	signer := swapInfo.Signers[0].String()
 
-	// Partition by source
 	jupiterSwaps := make([]SwapData, 0)
 	pumpfunSwaps := make([]SwapData, 0)
 	otherSwaps := make([]SwapData, 0)
@@ -178,7 +183,6 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 		}
 	}
 
-	// 1) Jupiter: already authoritative
 	if len(jupiterSwaps) > 0 {
 		jupiterInfo, err := parseJupiterEvents(jupiterSwaps)
 		if err != nil {
@@ -194,7 +198,6 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 		return swapInfo, nil
 	}
 
-	// 2) Pump.fun route event has full details
 	if len(pumpfunSwaps) > 0 {
 		switch data := pumpfunSwaps[0].Data.(type) {
 		case *PumpfunTradeEvent:
@@ -221,9 +224,8 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 		}
 	}
 
-	// 3) Generic AMMs (Meteora/Raydium/Orca/OKX-routed, etc.)
 	if len(otherSwaps) > 0 {
-		// Build set of user-owned SPL token accounts from pre+post balances.
+		// Build user-owned token accounts
 		userTokenAccounts := make(map[string]bool)
 		for _, b := range p.txMeta.PreTokenBalances {
 			if b.Owner.String() == signer {
@@ -244,41 +246,35 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 			destination string
 			authority   string
 		}
-
 		var moves []move
-		// Normalize all transfers
+
 		for _, sd := range otherSwaps {
 			switch d := sd.Data.(type) {
 			case *TransferData:
-				m := move{
+				moves = append(moves, move{
 					mint:        d.Mint,
 					amount:      d.Info.Amount,
 					decimals:    d.Decimals,
 					source:      d.Info.Source,
 					destination: d.Info.Destination,
 					authority:   d.Info.Authority,
-				}
-				moves = append(moves, m)
+				})
 			case *TransferCheck:
 				amt, err := strconv.ParseUint(d.Info.TokenAmount.Amount, 10, 64)
 				if err != nil {
 					continue
 				}
-				m := move{
+				moves = append(moves, move{
 					mint:        d.Info.Mint,
 					amount:      amt,
 					decimals:    d.Info.TokenAmount.Decimals,
 					source:      d.Info.Source,
 					destination: d.Info.Destination,
 					authority:   d.Info.Authority,
-				}
-				moves = append(moves, m)
+				})
 			}
 		}
 
-		// Inputs:
-		//   - Prefer transfers AUTHORIZED by signer
-		//   - Also include transfers whose SOURCE is a signer-owned token account
 		inputTotals := make(map[string]uint64)
 		inputDecimals := make(map[string]uint8)
 		for _, m := range moves {
@@ -293,7 +289,6 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 			}
 		}
 
-		// Outputs: transfers CREDITED to signer-owned token accounts
 		outputTotals := make(map[string]uint64)
 		outputDecimals := make(map[string]uint8)
 		for _, m := range moves {
@@ -308,7 +303,7 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 			}
 		}
 
-		// Choose dominant input/output mints (largest volume)
+		// pick largest by volume
 		var inputMint string
 		var inputAmt uint64
 		for mint, amt := range inputTotals {
@@ -326,15 +321,15 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 			}
 		}
 
-		// Fallback to old heuristic if needed
+		// fallback if empty
 		if inputMint == "" || outputMint == "" {
 			var uniqueTokens []TokenTransfer
-			seenTokens := make(map[string]bool)
+			seen := map[string]bool{}
 			for _, sd := range otherSwaps {
 				tt := getTransferFromSwapData(sd)
-				if tt != nil && !seenTokens[tt.mint] {
+				if tt != nil && !seen[tt.mint] {
 					uniqueTokens = append(uniqueTokens, *tt)
-					seenTokens[tt.mint] = true
+					seen[tt.mint] = true
 				}
 			}
 			if len(uniqueTokens) >= 2 {
@@ -359,44 +354,12 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 			}
 		}
 
-		// If still missing, pick any remaining totals
-		if inputMint == "" {
-			type kv struct {
-				k string
-				v uint64
-			}
-			var arr []kv
-			for k, v := range inputTotals {
-				arr = append(arr, kv{k, v})
-			}
-			sort.Slice(arr, func(i, j int) bool { return arr[i].v > arr[j].v })
-			if len(arr) > 0 {
-				inputMint, inputAmt = arr[0].k, arr[0].v
-			}
-		}
-		if outputMint == "" {
-			type kv struct {
-				k string
-				v uint64
-			}
-			var arr []kv
-			for k, v := range outputTotals {
-				arr = append(arr, kv{k, v})
-			}
-			sort.Slice(arr, func(i, j int) bool { return arr[i].v > arr[j].v })
-			if len(arr) > 0 {
-				outputMint, outputAmt = arr[0].k, arr[0].v
-			}
-		}
-
-		// >>> NEW: correct input amount using signer balance delta for SPL tokens
+		// correct input amount using signer balance delta for SPL tokens (avoids double-count)
 		if inputMint != "" && inputMint != NATIVE_SOL_MINT_PROGRAM_ID.String() {
 			if d, err := p.getTokenBalanceChanges(solana.MustPublicKeyFromBase58(inputMint)); err == nil {
-				// use absolute delta; for input it should be negative (spent)
 				inputAmt = uint64(abs(d))
 			}
 		}
-		// <<<
 
 		if inputMint != "" && outputMint != "" {
 			swapInfo.TokenInMint = solana.MustPublicKeyFromBase58(inputMint)
@@ -474,7 +437,8 @@ func (p *Parser) processRouterSwaps(instructionIndex int) []SwapData {
 
 		case (progID.Equals(METEORA_PROGRAM_ID) ||
 			progID.Equals(METEORA_POOLS_PROGRAM_ID) ||
-			progID.Equals(METEORA_DLMM_PROGRAM_ID)) && !processedProtocols[PROTOCOL_METEORA]:
+			progID.Equals(METEORA_DLMM_PROGRAM_ID) ||
+			progID.Equals(METEORA_DBC_PROGRAM_ID)) && !processedProtocols[PROTOCOL_METEORA]:
 			processedProtocols[PROTOCOL_METEORA] = true
 			if meteoraSwaps := p.processMeteoraSwaps(instructionIndex); len(meteoraSwaps) > 0 {
 				swaps = append(swaps, meteoraSwaps...)
