@@ -100,7 +100,7 @@ func (p *Parser) ParseTransaction() ([]SwapData, error) {
 				parsedSwaps = append(parsedSwaps, innerSwaps...)
 			}
 		case progID.Equals(OKX_DEX_ROUTER_PROGRAM_ID):
-			okx := p.processOKXSwaps(i)
+			okx := p.processOKXSwaps(i) // includes aggregate + legs
 			if len(okx) > 0 {
 				parsedSwaps = append(parsedSwaps, okx...)
 				skip = true
@@ -128,7 +128,7 @@ func (p *Parser) ParseTransaction() ([]SwapData, error) {
 			progID.Equals(METEORA_POOLS_PROGRAM_ID) ||
 			progID.Equals(METEORA_DLMM_PROGRAM_ID) ||
 			progID.Equals(METEORA_DBC_PROGRAM_ID) ||
-			progID.Equals(METEORA_DAMM_V2_PROGRAM_ID): // NEW: DAMM v2
+			progID.Equals(METEORA_DAMM_V2_PROGRAM_ID): // include DAMM v2
 			parsedSwaps = append(parsedSwaps, p.processMeteoraSwaps(i)...)
 		case progID.Equals(PUMPFUN_AMM_PROGRAM_ID):
 			parsedSwaps = append(parsedSwaps, p.processPumpfunAMMSwaps(i)...)
@@ -169,7 +169,9 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 		swapInfo.Signers = []solana.PublicKey{p.allAccountKeys[0]}
 	}
 
+	// Priorities: Jupiter events → OKX aggregate → Pumpfun events → aggregate legs
 	jupiterSwaps := make([]SwapData, 0)
+	var okxAgg *OKXSwapEventData
 	pumpfunSwaps := make([]SwapData, 0)
 	otherSwaps := make([]SwapData, 0)
 
@@ -177,6 +179,12 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 		switch sd.Type {
 		case JUPITER:
 			jupiterSwaps = append(jupiterSwaps, sd)
+		case OKX:
+			if okxAgg == nil {
+				if v, ok := sd.Data.(*OKXSwapEventData); ok {
+					okxAgg = v
+				}
+			}
 		case PUMP_FUN:
 			pumpfunSwaps = append(pumpfunSwaps, sd)
 		default:
@@ -198,6 +206,19 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 			return swapInfo, nil
 		}
 		// If Jupiter events failed to decode, fall back to aggregating legs below.
+	}
+
+	// OKX aggregate (authoritative router totals)
+	if okxAgg != nil {
+		swapInfo.TokenInMint = okxAgg.InputMint
+		swapInfo.TokenInAmount = okxAgg.InputAmount
+		swapInfo.TokenInDecimals = okxAgg.InputDecimals
+		swapInfo.TokenOutMint = okxAgg.OutputMint
+		swapInfo.TokenOutAmount = okxAgg.OutputAmount
+		swapInfo.TokenOutDecimals = okxAgg.OutputDecimals
+		swapInfo.AMMs = append(swapInfo.AMMs, string(OKX))
+		swapInfo.Timestamp = time.Now()
+		return swapInfo, nil
 	}
 
 	// Pump.fun native event
@@ -311,6 +332,12 @@ func getTransferFromSwapData(swapData SwapData) *TokenTransfer {
 			amount:   data.InputAmount,
 			decimals: data.InputMintDecimals,
 		}
+	case *OKXSwapEventData:
+		return &TokenTransfer{
+			mint:     data.InputMint.String(),
+			amount:   data.InputAmount,
+			decimals: data.InputDecimals,
+		}
 	}
 	return nil
 }
@@ -348,7 +375,7 @@ func (p *Parser) processRouterSwaps(instructionIndex int) []SwapData {
 			progID.Equals(METEORA_POOLS_PROGRAM_ID) ||
 			progID.Equals(METEORA_DLMM_PROGRAM_ID) ||
 			progID.Equals(METEORA_DBC_PROGRAM_ID) ||
-			progID.Equals(METEORA_DAMM_V2_PROGRAM_ID)) && !processedProtocols[PROTOCOL_METEORA]: // NEW: DAMM v2
+			progID.Equals(METEORA_DAMM_V2_PROGRAM_ID)) && !processedProtocols[PROTOCOL_METEORA]:
 			processedProtocols[PROTOCOL_METEORA] = true
 			if meteoraSwaps := p.processMeteoraSwaps(instructionIndex); len(meteoraSwaps) > 0 {
 				swaps = append(swaps, meteoraSwaps...)
