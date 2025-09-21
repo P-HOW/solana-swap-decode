@@ -7,12 +7,12 @@ import (
 	"github.com/mr-tron/base58"
 )
 
-// isTokenProgram returns true for the original SPL Token program and Token-2022.
+// Treat both Token and Token-2022 as token program (used in several places)
 func (p *Parser) isTokenProgram(pk solana.PublicKey) bool {
 	return pk.Equals(solana.TokenProgramID) || pk.Equals(solana.Token2022ProgramID)
 }
 
-// isTransfer checks if the instruction is a token transfer (Token v1).
+// isTransfer: Token Program "Transfer" (3)
 func (p *Parser) isTransfer(instr solana.CompiledInstruction) bool {
 	progID := p.allAccountKeys[instr.ProgramIDIndex]
 	if !progID.Equals(solana.TokenProgramID) {
@@ -21,7 +21,6 @@ func (p *Parser) isTransfer(instr solana.CompiledInstruction) bool {
 	if len(instr.Accounts) < 3 || len(instr.Data) < 9 {
 		return false
 	}
-	// Token Program "Transfer" (u8 = 3)
 	if instr.Data[0] != 3 {
 		return false
 	}
@@ -33,7 +32,7 @@ func (p *Parser) isTransfer(instr solana.CompiledInstruction) bool {
 	return true
 }
 
-// isTransferCheck checks if the instruction is a token transfer check (Token v1 or Token-2022).
+// isTransferCheck: Token or Token-2022 "TransferChecked" (12)
 func (p *Parser) isTransferCheck(instr solana.CompiledInstruction) bool {
 	progID := p.allAccountKeys[instr.ProgramIDIndex]
 	if !p.isTokenProgram(progID) {
@@ -42,7 +41,6 @@ func (p *Parser) isTransferCheck(instr solana.CompiledInstruction) bool {
 	if len(instr.Accounts) < 4 || len(instr.Data) < 9 {
 		return false
 	}
-	// Token Program "TransferChecked" (u8 = 12)
 	if instr.Data[0] != 12 {
 		return false
 	}

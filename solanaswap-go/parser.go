@@ -37,7 +37,6 @@ func NewTransactionParser(tx *rpc.GetTransactionResult) (*Parser, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get transaction: %w", err)
 	}
-
 	return NewTransactionParserFromTransaction(txInfo, tx.Meta)
 }
 
@@ -61,11 +60,9 @@ func NewTransactionParserFromTransaction(tx *solana.Transaction, txMeta *rpc.Tra
 	if err := parser.extractSPLTokenInfo(); err != nil {
 		return nil, fmt.Errorf("failed to extract SPL Token Addresses: %w", err)
 	}
-
 	if err := parser.extractSPLDecimals(); err != nil {
 		return nil, fmt.Errorf("failed to extract SPL decimals: %w", err)
 	}
-
 	return parser, nil
 }
 
@@ -74,6 +71,7 @@ type SwapData struct {
 	Data interface{}
 }
 
+// Jupiter is treated like a router only if we actually parse something under it.
 func (p *Parser) ParseTransaction() ([]SwapData, error) {
 	var parsedSwaps []SwapData
 
@@ -85,7 +83,7 @@ func (p *Parser) ParseTransaction() ([]SwapData, error) {
 			jup := p.processJupiterSwaps(i)
 			if len(jup) > 0 {
 				parsedSwaps = append(parsedSwaps, jup...)
-				skip = true // only skip if we *extracted* something under this Jupiter route
+				skip = true // only skip if something was parsed under Jupiter
 			}
 		case progID.Equals(MOONSHOT_PROGRAM_ID):
 			ms := p.processMoonshotSwaps()
@@ -113,6 +111,7 @@ func (p *Parser) ParseTransaction() ([]SwapData, error) {
 		return parsedSwaps, nil
 	}
 
+	// Fallback second pass: direct AMM outer instructions
 	for i, outerInstruction := range p.txInfo.Message.Instructions {
 		progID := p.allAccountKeys[outerInstruction.ProgramIDIndex]
 		switch {
@@ -123,20 +122,15 @@ func (p *Parser) ParseTransaction() ([]SwapData, error) {
 			progID.Equals(RAYDIUM_LAUNCHLAB_PROGRAM_ID) ||
 			progID.Equals(solana.MustPublicKeyFromBase58("AP51WLiiqTdbZfgyRMs35PsZpdmLuPDdHYmrB23pEtMU")):
 			parsedSwaps = append(parsedSwaps, p.processRaydSwaps(i)...)
-
 		case progID.Equals(ORCA_PROGRAM_ID):
 			parsedSwaps = append(parsedSwaps, p.processOrcaSwaps(i)...)
-
 		case progID.Equals(METEORA_PROGRAM_ID) ||
 			progID.Equals(METEORA_POOLS_PROGRAM_ID) ||
 			progID.Equals(METEORA_DLMM_PROGRAM_ID) ||
-			// NEW: handle Meteora DAMM v2 as a direct outer instruction
-			progID.Equals(METEORA_DAMM_V2_PROGRAM_ID):
+			progID.Equals(METEORA_DBC_PROGRAM_ID): // NEW: DBC
 			parsedSwaps = append(parsedSwaps, p.processMeteoraSwaps(i)...)
-
 		case progID.Equals(PUMPFUN_AMM_PROGRAM_ID):
 			parsedSwaps = append(parsedSwaps, p.processPumpfunAMMSwaps(i)...)
-
 		case progID.Equals(PUMP_FUN_PROGRAM_ID) ||
 			progID.Equals(solana.MustPublicKeyFromBase58("BSfD6SHZigAfDWSjzD5Q41jw8LmKwtmjskPH9XW1mrRW")):
 			parsedSwaps = append(parsedSwaps, p.processPumpfunSwaps(i)...)
@@ -166,9 +160,7 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 		return nil, fmt.Errorf("no swap data provided")
 	}
 
-	swapInfo := &SwapInfo{
-		Signatures: p.txInfo.Signatures,
-	}
+	swapInfo := &SwapInfo{Signatures: p.txInfo.Signatures}
 
 	if p.containsDCAProgram() {
 		swapInfo.Signers = []solana.PublicKey{p.allAccountKeys[2]}
@@ -180,34 +172,34 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 	pumpfunSwaps := make([]SwapData, 0)
 	otherSwaps := make([]SwapData, 0)
 
-	for _, swapData := range swapDatas {
-		switch swapData.Type {
+	for _, sd := range swapDatas {
+		switch sd.Type {
 		case JUPITER:
-			jupiterSwaps = append(jupiterSwaps, swapData)
+			jupiterSwaps = append(jupiterSwaps, sd)
 		case PUMP_FUN:
-			pumpfunSwaps = append(pumpfunSwaps, swapData)
+			pumpfunSwaps = append(pumpfunSwaps, sd)
 		default:
-			otherSwaps = append(otherSwaps, swapData)
+			otherSwaps = append(otherSwaps, sd)
 		}
 	}
 
+	// Preferred: Jupiter events
 	if len(jupiterSwaps) > 0 {
 		jupiterInfo, err := parseJupiterEvents(jupiterSwaps)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse Jupiter events: %w", err)
+		if err == nil {
+			swapInfo.TokenInMint = jupiterInfo.TokenInMint
+			swapInfo.TokenInAmount = jupiterInfo.TokenInAmount
+			swapInfo.TokenInDecimals = jupiterInfo.TokenInDecimals
+			swapInfo.TokenOutMint = jupiterInfo.TokenOutMint
+			swapInfo.TokenOutAmount = jupiterInfo.TokenOutAmount
+			swapInfo.TokenOutDecimals = jupiterInfo.TokenOutDecimals
+			swapInfo.AMMs = jupiterInfo.AMMs
+			return swapInfo, nil
 		}
-
-		swapInfo.TokenInMint = jupiterInfo.TokenInMint
-		swapInfo.TokenInAmount = jupiterInfo.TokenInAmount
-		swapInfo.TokenInDecimals = jupiterInfo.TokenInDecimals
-		swapInfo.TokenOutMint = jupiterInfo.TokenOutMint
-		swapInfo.TokenOutAmount = jupiterInfo.TokenOutAmount
-		swapInfo.TokenOutDecimals = jupiterInfo.TokenOutDecimals
-		swapInfo.AMMs = jupiterInfo.AMMs
-
-		return swapInfo, nil
+		// If Jupiter events failed to decode, fall back to aggregating legs below.
 	}
 
+	// Pump.fun native event
 	if len(pumpfunSwaps) > 0 {
 		switch data := pumpfunSwaps[0].Data.(type) {
 		case *PumpfunTradeEvent:
@@ -234,15 +226,15 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 		}
 	}
 
+	// Aggregate legs (Raydium/Orca/Meteora/Pump.fun AMM etc.)
 	if len(otherSwaps) > 0 {
 		var uniqueTokens []TokenTransfer
 		seenTokens := make(map[string]bool)
 
-		for _, swapData := range otherSwaps {
-			transfer := getTransferFromSwapData(swapData)
-			if transfer != nil && !seenTokens[transfer.mint] {
-				uniqueTokens = append(uniqueTokens, *transfer)
-				seenTokens[transfer.mint] = true
+		for _, sd := range otherSwaps {
+			if tr := getTransferFromSwapData(sd); tr != nil && !seenTokens[tr.mint] {
+				uniqueTokens = append(uniqueTokens, *tr)
+				seenTokens[tr.mint] = true
 			}
 		}
 
@@ -252,23 +244,22 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 
 			seenInputs := make(map[string]bool)
 			seenOutputs := make(map[string]bool)
-			var totalInputAmount uint64 = 0
-			var totalOutputAmount uint64 = 0
+			var totalInputAmount uint64
+			var totalOutputAmount uint64
 
-			for _, swapData := range otherSwaps {
-				transfer := getTransferFromSwapData(swapData)
-				if transfer == nil {
+			for _, sd := range otherSwaps {
+				tr := getTransferFromSwapData(sd)
+				if tr == nil {
 					continue
 				}
-
-				amountStr := fmt.Sprintf("%d-%s", transfer.amount, transfer.mint)
-				if transfer.mint == inputTransfer.mint && !seenInputs[amountStr] {
-					totalInputAmount += transfer.amount
-					seenInputs[amountStr] = true
+				key := fmt.Sprintf("%d-%s", tr.amount, tr.mint)
+				if tr.mint == inputTransfer.mint && !seenInputs[key] {
+					totalInputAmount += tr.amount
+					seenInputs[key] = true
 				}
-				if transfer.mint == outputTransfer.mint && !seenOutputs[amountStr] {
-					totalOutputAmount += transfer.amount
-					seenOutputs[amountStr] = true
+				if tr.mint == outputTransfer.mint && !seenOutputs[key] {
+					totalOutputAmount += tr.amount
+					seenOutputs[key] = true
 				}
 			}
 
@@ -280,10 +271,10 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 			swapInfo.TokenOutDecimals = outputTransfer.decimals
 
 			seenAMMs := make(map[string]bool)
-			for _, swapData := range otherSwaps {
-				if !seenAMMs[string(swapData.Type)] {
-					swapInfo.AMMs = append(swapInfo.AMMs, string(swapData.Type))
-					seenAMMs[string(swapData.Type)] = true
+			for _, sd := range otherSwaps {
+				if !seenAMMs[string(sd.Type)] {
+					swapInfo.AMMs = append(swapInfo.AMMs, string(sd.Type))
+					seenAMMs[string(sd.Type)] = true
 				}
 			}
 
@@ -312,6 +303,12 @@ func getTransferFromSwapData(swapData SwapData) *TokenTransfer {
 			mint:     data.Info.Mint,
 			amount:   amt,
 			decimals: data.Info.TokenAmount.Decimals,
+		}
+	case *JupiterSwapEventData:
+		return &TokenTransfer{
+			mint:     data.InputMint.String(),
+			amount:   data.InputAmount,
+			decimals: data.InputMintDecimals,
 		}
 	}
 	return nil
@@ -349,8 +346,7 @@ func (p *Parser) processRouterSwaps(instructionIndex int) []SwapData {
 		case (progID.Equals(METEORA_PROGRAM_ID) ||
 			progID.Equals(METEORA_POOLS_PROGRAM_ID) ||
 			progID.Equals(METEORA_DLMM_PROGRAM_ID) ||
-			// NEW: recognize DAMM v2 legs inside routers as well
-			progID.Equals(METEORA_DAMM_V2_PROGRAM_ID)) && !processedProtocols[PROTOCOL_METEORA]:
+			progID.Equals(METEORA_DBC_PROGRAM_ID)) && !processedProtocols[PROTOCOL_METEORA]: // NEW: DBC
 			processedProtocols[PROTOCOL_METEORA] = true
 			if meteoraSwaps := p.processMeteoraSwaps(instructionIndex); len(meteoraSwaps) > 0 {
 				swaps = append(swaps, meteoraSwaps...)
