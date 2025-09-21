@@ -1,6 +1,7 @@
 package solanaswapgo
 
 import (
+	"bytes"
 	"fmt"
 	"strconv"
 	"time"
@@ -76,7 +77,8 @@ func (p *Parser) ParseTransaction() ([]SwapData, error) {
 	var parsedSwaps []SwapData
 
 	skip := false
-	for i, outerInstruction := range p.txInfo.Message.Instructions {
+	for i := range p.txInfo.Message.Instructions {
+		outerInstruction := p.txInfo.Message.Instructions[i]
 		progID := p.allAccountKeys[outerInstruction.ProgramIDIndex]
 		switch {
 		case progID.Equals(JUPITER_PROGRAM_ID):
@@ -112,7 +114,8 @@ func (p *Parser) ParseTransaction() ([]SwapData, error) {
 	}
 
 	// Fallback second pass: direct AMM outer instructions
-	for i, outerInstruction := range p.txInfo.Message.Instructions {
+	for i := range p.txInfo.Message.Instructions {
+		outerInstruction := p.txInfo.Message.Instructions[i]
 		progID := p.allAccountKeys[outerInstruction.ProgramIDIndex]
 		switch {
 		case progID.Equals(RAYDIUM_V4_PROGRAM_ID) ||
@@ -168,8 +171,9 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 	} else {
 		swapInfo.Signers = []solana.PublicKey{p.allAccountKeys[0]}
 	}
+	signer := swapInfo.Signers[0]
 
-	// Priorities: Jupiter events → OKX aggregate → Pumpfun events → aggregate legs
+	// Priorities: Jupiter events → OKX aggregate → Pumpfun events/discriminators → aggregate legs
 	jupiterSwaps := make([]SwapData, 0)
 	var okxAgg *OKXSwapEventData
 	pumpfunSwaps := make([]SwapData, 0)
@@ -203,6 +207,7 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 			swapInfo.TokenOutAmount = jupiterInfo.TokenOutAmount
 			swapInfo.TokenOutDecimals = jupiterInfo.TokenOutDecimals
 			swapInfo.AMMs = jupiterInfo.AMMs
+			p.adjustOrderBySolDelta(swapInfo) // final sanity based on signer lamport delta
 			return swapInfo, nil
 		}
 		// If Jupiter events failed to decode, fall back to aggregating legs below.
@@ -218,34 +223,134 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 		swapInfo.TokenOutDecimals = okxAgg.OutputDecimals
 		swapInfo.AMMs = append(swapInfo.AMMs, string(OKX))
 		swapInfo.Timestamp = time.Now()
+		p.adjustOrderBySolDelta(swapInfo)
 		return swapInfo, nil
 	}
 
-	// Pump.fun native event
+	// Pump.fun native event OR discriminator-based fallback
 	if len(pumpfunSwaps) > 0 {
-		switch data := pumpfunSwaps[0].Data.(type) {
-		case *PumpfunTradeEvent:
-			if data.IsBuy {
-				swapInfo.TokenInMint = NATIVE_SOL_MINT_PROGRAM_ID
-				swapInfo.TokenInAmount = data.SolAmount
-				swapInfo.TokenInDecimals = 9
-				swapInfo.TokenOutMint = data.Mint
-				swapInfo.TokenOutAmount = data.TokenAmount
-				swapInfo.TokenOutDecimals = p.splDecimalsMap[data.Mint.String()]
-			} else {
-				swapInfo.TokenInMint = data.Mint
-				swapInfo.TokenInAmount = data.TokenAmount
-				swapInfo.TokenInDecimals = p.splDecimalsMap[data.Mint.String()]
-				swapInfo.TokenOutMint = NATIVE_SOL_MINT_PROGRAM_ID
-				swapInfo.TokenOutAmount = data.SolAmount
-				swapInfo.TokenOutDecimals = 9
+		// 1) Event path (unchanged)
+		for _, sd := range pumpfunSwaps {
+			if data, ok := sd.Data.(*PumpfunTradeEvent); ok && data != nil {
+				if data.IsBuy {
+					swapInfo.TokenInMint = NATIVE_SOL_MINT_PROGRAM_ID
+					swapInfo.TokenInAmount = data.SolAmount
+					swapInfo.TokenInDecimals = 9
+					swapInfo.TokenOutMint = data.Mint
+					swapInfo.TokenOutAmount = data.TokenAmount
+					swapInfo.TokenOutDecimals = p.splDecimalsMap[data.Mint.String()]
+				} else {
+					swapInfo.TokenInMint = data.Mint
+					swapInfo.TokenInAmount = data.TokenAmount
+					swapInfo.TokenInDecimals = p.splDecimalsMap[data.Mint.String()]
+					swapInfo.TokenOutMint = NATIVE_SOL_MINT_PROGRAM_ID
+					swapInfo.TokenOutAmount = data.SolAmount
+					swapInfo.TokenOutDecimals = 9
+				}
+				swapInfo.AMMs = append(swapInfo.AMMs, string(PUMP_FUN))
+				swapInfo.Timestamp = time.Unix(int64(data.Timestamp), 0)
+				p.adjustOrderBySolDelta(swapInfo)
+				return swapInfo, nil
 			}
-			swapInfo.AMMs = append(swapInfo.AMMs, string(pumpfunSwaps[0].Type))
-			swapInfo.Timestamp = time.Unix(int64(data.Timestamp), 0)
-			return swapInfo, nil
-		default:
-			otherSwaps = append(otherSwaps, pumpfunSwaps...)
 		}
+
+		// 2) Discriminator-based direction detection (backward-safe)
+		if has, isBuy := p.detectPumpfunBuySell(); has {
+			// Scan ALL inner transferChecked instructions in the TX.
+			solMint := NATIVE_SOL_MINT_PROGRAM_ID.String()
+
+			totalsAnyAuth := make(map[string]uint64)  // largest observed per mint (any authority)
+			totalsBySigner := make(map[string]uint64) // sum where authority == signer (what signer *sent*)
+
+			if p.txMeta != nil && p.txMeta.InnerInstructions != nil {
+				for _, set := range p.txMeta.InnerInstructions {
+					for _, ri := range set.Instructions {
+						inst := p.convertRPCToSolanaInstruction(ri)
+						if !p.isTransferCheck(inst) {
+							continue
+						}
+						tc := p.processTransferCheck(inst)
+						if tc == nil {
+							continue
+						}
+						amt, err := strconv.ParseUint(tc.Info.TokenAmount.Amount, 10, 64)
+						if err != nil {
+							continue
+						}
+						m := tc.Info.Mint
+						// Track largest seen per mint (main leg vs dust)
+						if amt > totalsAnyAuth[m] {
+							totalsAnyAuth[m] = amt
+						}
+						// What the signer authorized to move out
+						if tc.Info.Authority == signer.String() {
+							totalsBySigner[m] += amt
+						}
+					}
+				}
+			}
+
+			if isBuy {
+				// BUY: input = SOL debit from signer; output = largest non-SOL credit
+				inAmt := totalsBySigner[solMint]
+				var outMint string
+				var outAmt uint64
+				for m, a := range totalsAnyAuth {
+					if m == solMint {
+						continue
+					}
+					if a > outAmt {
+						outAmt = a
+						outMint = m
+					}
+				}
+				if inAmt > 0 && outMint != "" && outAmt > 0 {
+					swapInfo.TokenInMint = NATIVE_SOL_MINT_PROGRAM_ID
+					swapInfo.TokenInAmount = inAmt
+					swapInfo.TokenInDecimals = 9
+					swapInfo.TokenOutMint = solana.MustPublicKeyFromBase58(outMint)
+					swapInfo.TokenOutAmount = outAmt
+					swapInfo.TokenOutDecimals = p.splDecimalsMap[outMint]
+					swapInfo.AMMs = append(swapInfo.AMMs, string(PUMP_FUN))
+					swapInfo.Timestamp = time.Now()
+					p.adjustOrderBySolDelta(swapInfo)
+					return swapInfo, nil
+				}
+			} else {
+				// SELL: input = largest non-SOL the signer sent; output = largest SOL received
+				var inMint string
+				var inAmt uint64
+				for m, a := range totalsBySigner {
+					if m == solMint {
+						continue
+					}
+					if a > inAmt {
+						inAmt = a
+						inMint = m
+					}
+				}
+				outAmt := uint64(0)
+				if any, ok := totalsAnyAuth[solMint]; ok {
+					outAmt = any
+				}
+				if inMint != "" && inAmt > 0 && outAmt > 0 {
+					swapInfo.TokenInMint = solana.MustPublicKeyFromBase58(inMint)
+					swapInfo.TokenInAmount = inAmt
+					swapInfo.TokenInDecimals = p.splDecimalsMap[inMint]
+					swapInfo.TokenOutMint = NATIVE_SOL_MINT_PROGRAM_ID
+					swapInfo.TokenOutAmount = outAmt
+					swapInfo.TokenOutDecimals = 9
+					swapInfo.AMMs = append(swapInfo.AMMs, string(PUMP_FUN))
+					swapInfo.Timestamp = time.Now()
+					p.adjustOrderBySolDelta(swapInfo)
+					return swapInfo, nil
+				}
+			}
+			// If we couldn't resolve, keep falling through to generic aggregation.
+		}
+
+		// If neither event nor discriminator path resolved, include Pump.fun legs (if any) into the generic path.
+		otherSwaps = append(otherSwaps, pumpfunSwaps...)
 	}
 
 	// Aggregate legs (Raydium/Orca/Meteora/Pump.fun AMM etc.)
@@ -301,6 +406,7 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 			}
 
 			swapInfo.Timestamp = time.Now()
+			p.adjustOrderBySolDelta(swapInfo)
 			return swapInfo, nil
 		}
 	}
@@ -415,4 +521,82 @@ func (p *Parser) getInnerInstructions(index int) []solana.CompiledInstruction {
 	}
 
 	return nil
+}
+
+// ---- Pump.fun BUY/SELL discriminator detector (from pump.json) ----
+
+var pumpfunBuyDisc = []byte{102, 6, 61, 18, 1, 218, 235, 234}     // "buy"
+var pumpfunSellDisc = []byte{51, 230, 133, 164, 1, 127, 131, 173} // "sell"
+
+// detectPumpfunBuySell scans outer instructions for Pump.fun and returns (found, isBuy)
+func (p *Parser) detectPumpfunBuySell() (bool, bool) {
+	for _, ci := range p.txInfo.Message.Instructions {
+		progID := p.allAccountKeys[ci.ProgramIDIndex]
+		if !(progID.Equals(PUMP_FUN_PROGRAM_ID) || progID.Equals(solana.MustPublicKeyFromBase58("BSfD6SHZigAfDWSjzD5Q41jw8LmKwtmjskPH9XW1mrRW"))) {
+			continue
+		}
+		data := ci.Data
+		if len(data) >= 8 {
+			prefix := data[:8]
+			if bytes.Equal(prefix, pumpfunBuyDisc) {
+				return true, true
+			}
+			if bytes.Equal(prefix, pumpfunSellDisc) {
+				return true, false
+			}
+		}
+	}
+	return false, false
+}
+
+// ---- SOL flow sanity (final direction fix) ----
+
+// lamportDeltaFor returns post-pre lamports for the given pubkey from the tx meta.
+// Only covers message account keys (as exposed by Pre/PostBalances).
+func (p *Parser) lamportDeltaFor(pub solana.PublicKey) (int64, bool) {
+	if p.txMeta == nil {
+		return 0, false
+	}
+	msgKeys := p.txInfo.Message.AccountKeys
+	if len(p.txMeta.PreBalances) != len(msgKeys) || len(p.txMeta.PostBalances) != len(msgKeys) {
+		return 0, false
+	}
+	for i, k := range msgKeys {
+		if k.Equals(pub) {
+			pre := p.txMeta.PreBalances[i]
+			post := p.txMeta.PostBalances[i]
+			return int64(post) - int64(pre), true
+		}
+	}
+	return 0, false
+}
+
+func (p *Parser) adjustOrderBySolDelta(si *SwapInfo) {
+	solMint := NATIVE_SOL_MINT_PROGRAM_ID
+	// Only act if SOL is one side
+	if !(si.TokenInMint.Equals(solMint) || si.TokenOutMint.Equals(solMint)) {
+		return
+	}
+	// Need signer lamport delta
+	if len(si.Signers) == 0 {
+		return
+	}
+	delta, ok := p.lamportDeltaFor(si.Signers[0])
+	if !ok || delta == 0 {
+		// Can't determine or no net change: do nothing
+		return
+	}
+	// delta < 0 means signer paid SOL (BUY) ⇒ SOL must be TokenIn
+	// delta > 0 means signer received SOL (SELL) ⇒ SOL must be TokenOut
+	if delta < 0 && si.TokenOutMint.Equals(solMint) {
+		p.swapInOut(si)
+	} else if delta > 0 && si.TokenInMint.Equals(solMint) {
+		p.swapInOut(si)
+	}
+}
+
+func (p *Parser) swapInOut(si *SwapInfo) {
+	si.TokenInMint, si.TokenOutMint = si.TokenOutMint, si.TokenInMint
+	si.TokenInAmount, si.TokenOutAmount = si.TokenOutAmount, si.TokenInAmount
+	si.TokenInDecimals, si.TokenOutDecimals = si.TokenOutDecimals, si.TokenInDecimals
 }
