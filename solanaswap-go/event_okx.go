@@ -120,7 +120,8 @@ func (p *Parser) processOKXRouterSwaps(instructionIndex int) []SwapData {
 		case progID.Equals(METEORA_PROGRAM_ID) ||
 			progID.Equals(METEORA_POOLS_PROGRAM_ID) ||
 			progID.Equals(METEORA_DLMM_PROGRAM_ID) ||
-			progID.Equals(METEORA_DBC_PROGRAM_ID): // NEW: DBC recognized under OKX router
+			progID.Equals(METEORA_DBC_PROGRAM_ID) ||
+			progID.Equals(METEORA_DAMM_V2_PROGRAM_ID): // NEW: DAMM v2 recognized under OKX router
 			if processedProtocols[METEORA] {
 				continue
 			}

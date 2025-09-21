@@ -26,6 +26,8 @@ var (
 	METEORA_DLMM_PROGRAM_ID  = solana.MustPublicKeyFromBase58("King7ki4SKMBPb3iupnQwTyjsq294jaXsgLmJo8cb7T")
 	// NEW: Meteora Dynamic Bonding Curve (DBC) program (backward-compatible detection)
 	METEORA_DBC_PROGRAM_ID = solana.MustPublicKeyFromBase58("dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN")
+	// NEW: Meteora DAMM v2 router/AMM (adds support for tx like 4WLjMc... shown on Solscan)
+	METEORA_DAMM_V2_PROGRAM_ID = solana.MustPublicKeyFromBase58("cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG")
 
 	MOONSHOT_PROGRAM_ID       = solana.MustPublicKeyFromBase58("MoonCVVNZFSYkqNXP6bxHLPL6QQJiMagDL3qcqUQTrG")
 	ORCA_PROGRAM_ID           = solana.MustPublicKeyFromBase58("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc")

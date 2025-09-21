@@ -127,7 +127,8 @@ func (p *Parser) ParseTransaction() ([]SwapData, error) {
 		case progID.Equals(METEORA_PROGRAM_ID) ||
 			progID.Equals(METEORA_POOLS_PROGRAM_ID) ||
 			progID.Equals(METEORA_DLMM_PROGRAM_ID) ||
-			progID.Equals(METEORA_DBC_PROGRAM_ID): // NEW: DBC
+			progID.Equals(METEORA_DBC_PROGRAM_ID) ||
+			progID.Equals(METEORA_DAMM_V2_PROGRAM_ID): // NEW: DAMM v2
 			parsedSwaps = append(parsedSwaps, p.processMeteoraSwaps(i)...)
 		case progID.Equals(PUMPFUN_AMM_PROGRAM_ID):
 			parsedSwaps = append(parsedSwaps, p.processPumpfunAMMSwaps(i)...)
@@ -346,7 +347,8 @@ func (p *Parser) processRouterSwaps(instructionIndex int) []SwapData {
 		case (progID.Equals(METEORA_PROGRAM_ID) ||
 			progID.Equals(METEORA_POOLS_PROGRAM_ID) ||
 			progID.Equals(METEORA_DLMM_PROGRAM_ID) ||
-			progID.Equals(METEORA_DBC_PROGRAM_ID)) && !processedProtocols[PROTOCOL_METEORA]: // NEW: DBC
+			progID.Equals(METEORA_DBC_PROGRAM_ID) ||
+			progID.Equals(METEORA_DAMM_V2_PROGRAM_ID)) && !processedProtocols[PROTOCOL_METEORA]: // NEW: DAMM v2
 			processedProtocols[PROTOCOL_METEORA] = true
 			if meteoraSwaps := p.processMeteoraSwaps(instructionIndex); len(meteoraSwaps) > 0 {
 				swaps = append(swaps, meteoraSwaps...)
