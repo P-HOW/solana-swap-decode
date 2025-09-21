@@ -68,7 +68,6 @@ func (p *Parser) processJupiterSwaps(instructionIndex int) []SwapData {
 	}
 
 	// As a last resort, harvest TokenProgram transfers right under this route.
-	// (This helps when an AMM leg is very custom but still uses standard token transfers.)
 	for _, innerInstructionSet := range p.txMeta.InnerInstructions {
 		if innerInstructionSet.Index != uint16(instructionIndex) {
 			continue
@@ -87,7 +86,6 @@ func (p *Parser) processJupiterSwaps(instructionIndex int) []SwapData {
 			}
 		}
 	}
-
 	return swaps
 }
 
@@ -184,47 +182,62 @@ func (p *Parser) extractSPLDecimals() error {
 	return nil
 }
 
-// parseJupiterEvents parses Jupiter swap events and returns a SwapInfo representing the entire route
+// parseJupiterEvents aggregates all legs from Jupiter events into one SwapInfo.
 func parseJupiterEvents(events []SwapData) (*SwapInfo, error) {
 	if len(events) == 0 {
 		return nil, fmt.Errorf("no events provided")
 	}
 
-	var firstSwap, lastSwap *JupiterSwapEventData
+	var (
+		have              bool
+		totalIn, totalOut uint64
+		inMint, outMint   solana.PublicKey
+		inDec, outDec     uint8
+	)
 
-	for i, event := range events {
+	for _, event := range events {
 		if event.Type != JUPITER {
 			continue
 		}
 
-		var jupiterEvent JupiterSwapEventData
-		eventData, err := json.Marshal(event.Data)
+		var leg JupiterSwapEventData
+		raw, err := json.Marshal(event.Data)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal event data: %v", err)
 		}
-
-		if err := json.Unmarshal(eventData, &jupiterEvent); err != nil {
+		if err := json.Unmarshal(raw, &leg); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal Jupiter event data: %v", err)
 		}
 
-		if i == 0 {
-			firstSwap = &jupiterEvent
+		if !have {
+			inMint, outMint = leg.InputMint, leg.OutputMint
+			inDec, outDec = leg.InputMintDecimals, leg.OutputMintDecimals
+			have = true
 		}
-		lastSwap = &jupiterEvent
+
+		// In practice, all legs share the same route-level input/output mints.
+		// If a leg differs (edge case), we only sum amounts that match the
+		// route-level mints we captured first.
+		if leg.InputMint.Equals(inMint) {
+			totalIn += leg.InputAmount
+		}
+		if leg.OutputMint.Equals(outMint) {
+			totalOut += leg.OutputAmount
+		}
 	}
 
-	if firstSwap == nil || lastSwap == nil {
+	if !have {
 		return nil, fmt.Errorf("no valid Jupiter swaps found")
 	}
 
 	swapInfo := &SwapInfo{
 		AMMs:             []string{string(JUPITER)},
-		TokenInMint:      firstSwap.InputMint,
-		TokenInAmount:    firstSwap.InputAmount,
-		TokenInDecimals:  firstSwap.InputMintDecimals,
-		TokenOutMint:     lastSwap.OutputMint,
-		TokenOutAmount:   lastSwap.OutputAmount,
-		TokenOutDecimals: lastSwap.OutputMintDecimals,
+		TokenInMint:      inMint,
+		TokenInAmount:    totalIn,
+		TokenInDecimals:  inDec,
+		TokenOutMint:     outMint,
+		TokenOutAmount:   totalOut,
+		TokenOutDecimals: outDec,
 	}
 	return swapInfo, nil
 }
