@@ -29,22 +29,25 @@ type apiError struct {
 	Details string `json:"details,omitempty"`
 }
 
-func writeJSON(w http.ResponseWriter, status int, v interface{}) {
+func writeJSONMaybePretty(w http.ResponseWriter, status int, v interface{}, pretty bool) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	enc := json.NewEncoder(w)
+	if pretty {
+		enc.SetIndent("", "  ")
+	}
+	_ = enc.Encode(v)
 }
 
 func main() {
-	// Hardcoded Helius RPC URL with API key (per your request)
+	// Helius RPC URL (hardcoded as requested)
 	rpcURL := "https://mainnet.helius-rpc.com/?api-key=f7aa96fd-2bb1-49ce-8468-894bcbb22551"
-	// Per-request RPC timeout
 	const rpcTimeout = 10 * time.Second
 
-	// Max transaction version (same as your original)
+	// Max transaction version
 	var maxTxVersionU64 uint64 = 0
 
-	// Build the Solana RPC client once; it's safe for concurrent use.
+	// Shared Solana RPC client (safe for concurrent use)
 	client := rpc.New(rpcURL)
 
 	// Health endpoint
@@ -53,24 +56,56 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	// Parse endpoint
+	// Simple HTML form for browser use (GET)
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`
+<!doctype html>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Solana Tx Parser</title>
+<div style="font: 16px system-ui; max-width: 900px; margin: 40px auto; line-height:1.5;">
+  <h1 style="margin:0 0 16px;">Solana Swap Decode (browser)</h1>
+  <form action="/parse" method="get">
+    <label>Signature<br>
+      <input name="signature" style="width: 100%; padding: 8px;" placeholder="Paste a transaction signature" autofocus>
+    </label>
+    <div style="margin: 12px 0;">
+      <label><input type="checkbox" name="pretty" value="1" checked> pretty</label>
+    </div>
+    <button type="submit" style="padding: 8px 14px;">Parse</button>
+  </form>
+  <p style="margin-top: 24px; color:#666;">This form issues a GET to <code>/parse?signature=...&pretty=1</code>.</p>
+</div>
+`))
+	})
+
+	// Parse endpoint: supports POST (JSON) and GET (?signature=...&pretty=1)
 	http.HandleFunc("/parse", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, apiError{Error: "method_not_allowed"})
+		pretty := r.URL.Query().Get("pretty") == "1" || r.URL.Query().Get("pretty") == "true"
+
+		// Accept POST with JSON body or GET with query param
+		var sigStr string
+		switch r.Method {
+		case http.MethodPost:
+			var req parseReq
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeJSONMaybePretty(w, http.StatusBadRequest, apiError{Error: "bad_request", Details: "invalid JSON body"}, pretty)
+				return
+			}
+			sigStr = req.Signature
+		case http.MethodGet:
+			sigStr = r.URL.Query().Get("signature")
+		default:
+			writeJSONMaybePretty(w, http.StatusMethodNotAllowed, apiError{Error: "method_not_allowed"}, pretty)
 			return
 		}
 
-		var req parseReq
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, apiError{Error: "bad_request", Details: "invalid JSON body"})
-			return
-		}
-		if req.Signature == "" {
-			writeJSON(w, http.StatusBadRequest, apiError{Error: "bad_request", Details: "signature is required"})
+		if sigStr == "" {
+			writeJSONMaybePretty(w, http.StatusBadRequest, apiError{Error: "bad_request", Details: "signature is required"}, pretty)
 			return
 		}
 
-		// Validate base58 sig without panicking
+		// Validate base58 signature without panicking
 		var sig solana.Signature
 		var sigErr error
 		func() {
@@ -79,14 +114,14 @@ func main() {
 					sigErr = errors.New("invalid signature format")
 				}
 			}()
-			sig = solana.MustSignatureFromBase58(req.Signature)
+			sig = solana.MustSignatureFromBase58(sigStr)
 		}()
 		if sigErr != nil {
-			writeJSON(w, http.StatusBadRequest, apiError{Error: "bad_request", Details: "invalid signature (base58)"})
+			writeJSONMaybePretty(w, http.StatusBadRequest, apiError{Error: "bad_request", Details: "invalid signature (base58)"}, pretty)
 			return
 		}
 
-		// Enforce 10s per request RPC timeout
+		// Per-request RPC timeout
 		ctx, cancel := context.WithTimeout(r.Context(), rpcTimeout)
 		defer cancel()
 
@@ -94,64 +129,56 @@ func main() {
 			Commitment:                     rpc.CommitmentConfirmed,
 			MaxSupportedTransactionVersion: &maxTxVersionU64,
 		})
-
-		// If timeout or deadline exceeded -> return {null, null} with 200 OK
 		if err != nil {
-			// Detect timeouts robustly (SDKs often wrap errors)
-			if errors.Is(err, context.DeadlineExceeded) ||
-				strings.Contains(strings.ToLower(err.Error()), "deadline") ||
-				strings.Contains(strings.ToLower(err.Error()), "timeout") {
-				writeJSON(w, http.StatusOK, parseResp{Transaction: nil, SwapInfo: nil})
+			low := strings.ToLower(err.Error())
+			if errors.Is(err, context.DeadlineExceeded) || strings.Contains(low, "deadline") || strings.Contains(low, "timeout") {
+				// Graceful timeout: return 200 with nulls
+				writeJSONMaybePretty(w, http.StatusOK, parseResp{Transaction: nil, SwapInfo: nil}, pretty)
 				return
 			}
-			// Non-timeout error
-			writeJSON(w, http.StatusBadGateway, apiError{Error: "rpc_error", Details: err.Error()})
+			writeJSONMaybePretty(w, http.StatusBadGateway, apiError{Error: "rpc_error", Details: err.Error()}, pretty)
 			return
 		}
-
-		// If RPC returns no transaction (not found), treat as a normal 404
 		if tx == nil {
-			writeJSON(w, http.StatusNotFound, apiError{Error: "not_found", Details: "transaction not found"})
+			writeJSONMaybePretty(w, http.StatusNotFound, apiError{Error: "not_found", Details: "transaction not found"}, pretty)
 			return
 		}
 
 		parser, err := solanaswapgo.NewTransactionParser(tx)
 		if err != nil {
-			writeJSON(w, http.StatusUnprocessableEntity, apiError{Error: "parse_init_error", Details: err.Error()})
+			writeJSONMaybePretty(w, http.StatusUnprocessableEntity, apiError{Error: "parse_init_error", Details: err.Error()}, pretty)
 			return
 		}
 
 		transactionData, err := parser.ParseTransaction()
 		if err != nil {
-			writeJSON(w, http.StatusUnprocessableEntity, apiError{Error: "parse_tx_error", Details: err.Error()})
+			writeJSONMaybePretty(w, http.StatusUnprocessableEntity, apiError{Error: "parse_tx_error", Details: err.Error()}, pretty)
 			return
 		}
 
 		swapInfo, err := parser.ProcessSwapData(transactionData)
 		if err != nil {
-			// Not all txs are swaps — OK to proceed with nil SwapInfo.
+			// Not all transactions are swaps; keep going with nil SwapInfo
 			log.Printf("swap processing warning: %v", err)
 		}
 
-		writeJSON(w, http.StatusOK, parseResp{
+		writeJSONMaybePretty(w, http.StatusOK, parseResp{
 			Transaction: transactionData,
 			SwapInfo:    swapInfo, // may be nil
-		})
+		}, pretty)
 	})
 
-	// Hardened HTTP server settings
+	// HTTP server settings
 	addr := ":8080"
 	srv := &http.Server{
 		Addr:              addr,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second, // enough to serialize JSON
+		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 
 	log.Printf("listening on http://%s (rpc=%s, per-request timeout=%ss)",
 		addr, rpcURL, strconv.Itoa(int(rpcTimeout/time.Second)))
-
-	// Start server (fatal on bind error)
 	log.Fatal(srv.ListenAndServe())
 }
