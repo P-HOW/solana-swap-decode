@@ -24,7 +24,7 @@ var (
 	METEORA_PROGRAM_ID       = solana.MustPublicKeyFromBase58("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo")
 	METEORA_POOLS_PROGRAM_ID = solana.MustPublicKeyFromBase58("Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB")
 	METEORA_DLMM_PROGRAM_ID  = solana.MustPublicKeyFromBase58("King7ki4SKMBPb3iupnQwTyjsq294jaXsgLmJo8cb7T")
-	// Meteora DAMM v2 (the one in your failing tx)
+	// NEW: Meteora DAMM v2 (a.k.a. “cpamm/damm v2”) program
 	METEORA_DAMM_V2_PROGRAM_ID = solana.MustPublicKeyFromBase58("cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG")
 
 	MOONSHOT_PROGRAM_ID       = solana.MustPublicKeyFromBase58("MoonCVVNZFSYkqNXP6bxHLPL6QQJiMagDL3qcqUQTrG")

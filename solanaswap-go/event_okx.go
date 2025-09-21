@@ -120,7 +120,8 @@ func (p *Parser) processOKXRouterSwaps(instructionIndex int) []SwapData {
 		case progID.Equals(METEORA_PROGRAM_ID) ||
 			progID.Equals(METEORA_POOLS_PROGRAM_ID) ||
 			progID.Equals(METEORA_DLMM_PROGRAM_ID) ||
-			progID.Equals(METEORA_DAMM_V2_PROGRAM_ID): // ✅ include DAMM v2 here
+			// NEW: OKX routes through Meteora DAMM v2 as well
+			progID.Equals(METEORA_DAMM_V2_PROGRAM_ID):
 			if processedProtocols[METEORA] {
 				continue
 			}
