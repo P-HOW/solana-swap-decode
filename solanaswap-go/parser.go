@@ -85,7 +85,7 @@ func (p *Parser) ParseTransaction() ([]SwapData, error) {
 			jup := p.processJupiterSwaps(i)
 			if len(jup) > 0 {
 				parsedSwaps = append(parsedSwaps, jup...)
-				skip = true // only skip if we collected something from this Jupiter route
+				skip = true // only skip if something was extracted from the Jupiter route
 			}
 		case progID.Equals(MOONSHOT_PROGRAM_ID):
 			ms := p.processMoonshotSwaps()
@@ -131,7 +131,7 @@ func (p *Parser) ParseTransaction() ([]SwapData, error) {
 		case progID.Equals(METEORA_PROGRAM_ID) ||
 			progID.Equals(METEORA_POOLS_PROGRAM_ID) ||
 			progID.Equals(METEORA_DLMM_PROGRAM_ID) ||
-			progID.Equals(METEORA_DAMM_V2_PROGRAM_ID): // NEW
+			progID.Equals(METEORA_DAMM_V2_PROGRAM_ID): // ✅ include DAMM v2
 			parsedSwaps = append(parsedSwaps, p.processMeteoraSwaps(i)...)
 
 		case progID.Equals(PUMPFUN_AMM_PROGRAM_ID):
@@ -354,7 +354,7 @@ func (p *Parser) processRouterSwaps(instructionIndex int) []SwapData {
 		case (progID.Equals(METEORA_PROGRAM_ID) ||
 			progID.Equals(METEORA_POOLS_PROGRAM_ID) ||
 			progID.Equals(METEORA_DLMM_PROGRAM_ID) ||
-			progID.Equals(METEORA_DAMM_V2_PROGRAM_ID)) && !processedProtocols[PROTOCOL_METEORA]: // NEW
+			progID.Equals(METEORA_DAMM_V2_PROGRAM_ID)) && !processedProtocols[PROTOCOL_METEORA]:
 			processedProtocols[PROTOCOL_METEORA] = true
 			if meteoraSwaps := p.processMeteoraSwaps(instructionIndex); len(meteoraSwaps) > 0 {
 				swaps = append(swaps, meteoraSwaps...)

@@ -40,11 +40,22 @@ func (p *Parser) processOKXSwaps(instructionIndex int) []SwapData {
 	p.Log.Infof("decoded okx swap instruction %d with discriminator: %x", instructionIndex, discriminator)
 
 	switch {
-	case bytes.Equal(discriminator, OKX_SWAP_DISCRIMINATOR[:]),
-		bytes.Equal(discriminator, OKX_SWAP2_DISCRIMINATOR[:]),
-		bytes.Equal(discriminator, OKX_COMMISSION_SPL_SWAP2_DISCRIMINATOR[:]),
-		bytes.Equal(discriminator, OKX_SWAP3_DISCRIMINATOR[:]):
+	case bytes.Equal(discriminator, OKX_SWAP_DISCRIMINATOR[:]):
+		p.Log.Infof("processing okx swap type: okx_swap for instruction %d", instructionIndex)
 		return p.processOKXRouterSwaps(instructionIndex)
+
+	case bytes.Equal(discriminator, OKX_SWAP2_DISCRIMINATOR[:]):
+		p.Log.Infof("processing okx swap type: okx_swap2 for instruction %d", instructionIndex)
+		return p.processOKXRouterSwaps(instructionIndex)
+
+	case bytes.Equal(discriminator, OKX_COMMISSION_SPL_SWAP2_DISCRIMINATOR[:]):
+		p.Log.Infof("processing okx swap type: okx_commission_spl_swap2 for instruction %d", instructionIndex)
+		return p.processOKXRouterSwaps(instructionIndex)
+
+	case bytes.Equal(discriminator, OKX_SWAP3_DISCRIMINATOR[:]):
+		p.Log.Infof("processing okx swap type: okx_swap3 for instruction %d", instructionIndex)
+		return p.processOKXRouterSwaps(instructionIndex)
+
 	default:
 		p.Log.Warnf("unknown okx swap discriminator %x for instruction %d", discriminator, instructionIndex)
 		swaps := p.processOKXRouterSwaps(instructionIndex)
@@ -60,7 +71,7 @@ func (p *Parser) processOKXSwaps(instructionIndex int) []SwapData {
 func (p *Parser) processOKXRouterSwaps(instructionIndex int) []SwapData {
 	var swaps []SwapData
 	seen := make(map[string]bool)
-	processed := make(map[SwapType]bool)
+	processedProtocols := make(map[SwapType]bool)
 
 	innerInstructions := p.getInnerInstructions(instructionIndex)
 	p.Log.Infof("processing okx router swaps for instruction %d: %d inner instructions", instructionIndex, len(innerInstructions))
@@ -77,66 +88,66 @@ func (p *Parser) processOKXRouterSwaps(instructionIndex int) []SwapData {
 			progID.Equals(RAYDIUM_CPMM_PROGRAM_ID) ||
 			progID.Equals(RAYDIUM_AMM_PROGRAM_ID) ||
 			progID.Equals(RAYDIUM_CONCENTRATED_LIQUIDITY_PROGRAM_ID):
-			if processed[RAYDIUM] {
+			if processedProtocols[RAYDIUM] {
 				continue
 			}
-			if s := p.processRaydSwaps(instructionIndex); len(s) > 0 {
-				for _, sw := range s {
-					k := getSwapKey(sw)
-					if !seen[k] {
-						swaps = append(swaps, sw)
-						seen[k] = true
+			if raydSwaps := p.processRaydSwaps(instructionIndex); len(raydSwaps) > 0 {
+				for _, swap := range raydSwaps {
+					key := getSwapKey(swap)
+					if !seen[key] {
+						swaps = append(swaps, swap)
+						seen[key] = true
 					}
 				}
-				processed[RAYDIUM] = true
+				processedProtocols[RAYDIUM] = true
 			}
 
 		case progID.Equals(ORCA_PROGRAM_ID):
-			if processed[ORCA] {
+			if processedProtocols[ORCA] {
 				continue
 			}
-			if s := p.processOrcaSwaps(instructionIndex); len(s) > 0 {
-				for _, sw := range s {
-					k := getSwapKey(sw)
-					if !seen[k] {
-						swaps = append(swaps, sw)
-						seen[k] = true
+			if orcaSwaps := p.processOrcaSwaps(instructionIndex); len(orcaSwaps) > 0 {
+				for _, swap := range orcaSwaps {
+					key := getSwapKey(swap)
+					if !seen[key] {
+						swaps = append(swaps, swap)
+						seen[key] = true
 					}
 				}
-				processed[ORCA] = true
+				processedProtocols[ORCA] = true
 			}
 
 		case progID.Equals(METEORA_PROGRAM_ID) ||
 			progID.Equals(METEORA_POOLS_PROGRAM_ID) ||
 			progID.Equals(METEORA_DLMM_PROGRAM_ID) ||
-			progID.Equals(METEORA_DBC_PROGRAM_ID):
-			if processed[METEORA] {
+			progID.Equals(METEORA_DAMM_V2_PROGRAM_ID): // ✅ include DAMM v2 here
+			if processedProtocols[METEORA] {
 				continue
 			}
-			if s := p.processMeteoraSwaps(instructionIndex); len(s) > 0 {
-				for _, sw := range s {
-					k := getSwapKey(sw)
-					if !seen[k] {
-						swaps = append(swaps, sw)
-						seen[k] = true
+			if meteoraSwaps := p.processMeteoraSwaps(instructionIndex); len(meteoraSwaps) > 0 {
+				for _, swap := range meteoraSwaps {
+					key := getSwapKey(swap)
+					if !seen[key] {
+						swaps = append(swaps, swap)
+						seen[key] = true
 					}
 				}
-				processed[METEORA] = true
+				processedProtocols[METEORA] = true
 			}
 
 		case progID.Equals(PUMP_FUN_PROGRAM_ID):
-			if processed[PUMP_FUN] {
+			if processedProtocols[PUMP_FUN] {
 				continue
 			}
-			if s := p.processPumpfunSwaps(instructionIndex); len(s) > 0 {
-				for _, sw := range s {
-					k := getSwapKey(sw)
-					if !seen[k] {
-						swaps = append(swaps, sw)
-						seen[k] = true
+			if pumpfunSwaps := p.processPumpfunSwaps(instructionIndex); len(pumpfunSwaps) > 0 {
+				for _, swap := range pumpfunSwaps {
+					key := getSwapKey(swap)
+					if !seen[key] {
+						swaps = append(swaps, swap)
+						seen[key] = true
 					}
 				}
-				processed[PUMP_FUN] = true
+				processedProtocols[PUMP_FUN] = true
 			}
 		}
 	}
