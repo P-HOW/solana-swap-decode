@@ -82,11 +82,17 @@ func (p *Parser) ParseTransaction() ([]SwapData, error) {
 		progID := p.allAccountKeys[outerInstruction.ProgramIDIndex]
 		switch {
 		case progID.Equals(JUPITER_PROGRAM_ID):
-			skip = true
-			parsedSwaps = append(parsedSwaps, p.processJupiterSwaps(i)...)
+			jup := p.processJupiterSwaps(i)
+			if len(jup) > 0 {
+				parsedSwaps = append(parsedSwaps, jup...)
+				skip = true // only skip if we collected something from this Jupiter route
+			}
 		case progID.Equals(MOONSHOT_PROGRAM_ID):
-			skip = true
-			parsedSwaps = append(parsedSwaps, p.processMoonshotSwaps()...)
+			ms := p.processMoonshotSwaps()
+			if len(ms) > 0 {
+				parsedSwaps = append(parsedSwaps, ms...)
+				skip = true
+			}
 		case progID.Equals(BANANA_GUN_PROGRAM_ID) ||
 			progID.Equals(MINTECH_PROGRAM_ID) ||
 			progID.Equals(BLOOM_PROGRAM_ID) ||
@@ -96,14 +102,18 @@ func (p *Parser) ParseTransaction() ([]SwapData, error) {
 				parsedSwaps = append(parsedSwaps, innerSwaps...)
 			}
 		case progID.Equals(OKX_DEX_ROUTER_PROGRAM_ID):
-			skip = true
-			parsedSwaps = append(parsedSwaps, p.processOKXSwaps(i)...)
+			okx := p.processOKXSwaps(i)
+			if len(okx) > 0 {
+				parsedSwaps = append(parsedSwaps, okx...)
+				skip = true
+			}
 		}
 	}
 	if skip {
 		return parsedSwaps, nil
 	}
 
+	// Direct AMM instructions (second pass)
 	for i, outerInstruction := range p.txInfo.Message.Instructions {
 		progID := p.allAccountKeys[outerInstruction.ProgramIDIndex]
 		switch {
@@ -118,11 +128,10 @@ func (p *Parser) ParseTransaction() ([]SwapData, error) {
 		case progID.Equals(ORCA_PROGRAM_ID):
 			parsedSwaps = append(parsedSwaps, p.processOrcaSwaps(i)...)
 
-		// Include all Meteora flavors (classic pools, DLMM, and NEW DBC)
 		case progID.Equals(METEORA_PROGRAM_ID) ||
 			progID.Equals(METEORA_POOLS_PROGRAM_ID) ||
 			progID.Equals(METEORA_DLMM_PROGRAM_ID) ||
-			progID.Equals(METEORA_DBC_PROGRAM_ID):
+			progID.Equals(METEORA_DAMM_V2_PROGRAM_ID): // NEW
 			parsedSwaps = append(parsedSwaps, p.processMeteoraSwaps(i)...)
 
 		case progID.Equals(PUMPFUN_AMM_PROGRAM_ID):
@@ -185,18 +194,17 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 	if len(jupiterSwaps) > 0 {
 		jupiterInfo, err := parseJupiterEvents(jupiterSwaps)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse Jupiter events: %w", err)
+			// fall through to leg aggregation
+		} else {
+			swapInfo.TokenInMint = jupiterInfo.TokenInMint
+			swapInfo.TokenInAmount = jupiterInfo.TokenInAmount
+			swapInfo.TokenInDecimals = jupiterInfo.TokenInDecimals
+			swapInfo.TokenOutMint = jupiterInfo.TokenOutMint
+			swapInfo.TokenOutAmount = jupiterInfo.TokenOutAmount
+			swapInfo.TokenOutDecimals = jupiterInfo.TokenOutDecimals
+			swapInfo.AMMs = jupiterInfo.AMMs
+			return swapInfo, nil
 		}
-
-		swapInfo.TokenInMint = jupiterInfo.TokenInMint
-		swapInfo.TokenInAmount = jupiterInfo.TokenInAmount
-		swapInfo.TokenInDecimals = jupiterInfo.TokenInDecimals
-		swapInfo.TokenOutMint = jupiterInfo.TokenOutMint
-		swapInfo.TokenOutAmount = jupiterInfo.TokenOutAmount
-		swapInfo.TokenOutDecimals = jupiterInfo.TokenOutDecimals
-		swapInfo.AMMs = jupiterInfo.AMMs
-
-		return swapInfo, nil
 	}
 
 	if len(pumpfunSwaps) > 0 {
@@ -304,6 +312,12 @@ func getTransferFromSwapData(swapData SwapData) *TokenTransfer {
 			amount:   amt,
 			decimals: data.Info.TokenAmount.Decimals,
 		}
+	case *JupiterSwapEventData:
+		return &TokenTransfer{
+			mint:     data.InputMint.String(),
+			amount:   data.InputAmount,
+			decimals: data.InputMintDecimals,
+		}
 	}
 	return nil
 }
@@ -340,7 +354,7 @@ func (p *Parser) processRouterSwaps(instructionIndex int) []SwapData {
 		case (progID.Equals(METEORA_PROGRAM_ID) ||
 			progID.Equals(METEORA_POOLS_PROGRAM_ID) ||
 			progID.Equals(METEORA_DLMM_PROGRAM_ID) ||
-			progID.Equals(METEORA_DBC_PROGRAM_ID)) && !processedProtocols[PROTOCOL_METEORA]:
+			progID.Equals(METEORA_DAMM_V2_PROGRAM_ID)) && !processedProtocols[PROTOCOL_METEORA]: // NEW
 			processedProtocols[PROTOCOL_METEORA] = true
 			if meteoraSwaps := p.processMeteoraSwaps(instructionIndex); len(meteoraSwaps) > 0 {
 				swaps = append(swaps, meteoraSwaps...)
