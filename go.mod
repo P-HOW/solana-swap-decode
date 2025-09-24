@@ -5,6 +5,7 @@ go 1.23.2
 require (
 	github.com/gagliardetto/binary v0.8.0
 	github.com/gagliardetto/solana-go v1.13.0
+	github.com/joho/godotenv v1.5.1
 	github.com/mr-tron/base58 v1.2.0
 	github.com/sirupsen/logrus v1.9.3
 )

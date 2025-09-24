@@ -254,13 +254,14 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 			}
 		}
 
-		// 2) Discriminator-based direction detection (backward-safe)
+		// 2) Discriminator-based direction detection (unchanged)
 		if has, isBuy := p.detectPumpfunBuySell(); has {
 			// Scan ALL inner transferChecked instructions in the TX.
 			solMint := NATIVE_SOL_MINT_PROGRAM_ID.String()
 
 			totalsAnyAuth := make(map[string]uint64)  // largest observed per mint (any authority)
 			totalsBySigner := make(map[string]uint64) // sum where authority == signer (what signer *sent*)
+			seenSignerAny := make(map[string]bool)
 
 			if p.txMeta != nil && p.txMeta.InnerInstructions != nil {
 				for _, set := range p.txMeta.InnerInstructions {
@@ -278,20 +279,25 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 							continue
 						}
 						m := tc.Info.Mint
-						// Track largest seen per mint (main leg vs dust)
+
+						// largest seen per mint (helps separate main leg vs dust)
 						if amt > totalsAnyAuth[m] {
 							totalsAnyAuth[m] = amt
 						}
-						// What the signer authorized to move out
+
+						// signer-authorized outflow, dedup per exact leg
 						if tc.Info.Authority == signer.String() {
-							totalsBySigner[m] += amt
+							key := fmt.Sprintf("tc|%s|%s|%s|%s|%d", tc.Info.Authority, tc.Info.Source, tc.Info.Destination, m, amt)
+							if !seenSignerAny[key] {
+								totalsBySigner[m] += amt
+								seenSignerAny[key] = true
+							}
 						}
 					}
 				}
 			}
 
 			if isBuy {
-				// BUY: input = SOL debit from signer; output = largest non-SOL credit
 				inAmt := totalsBySigner[solMint]
 				var outMint string
 				var outAmt uint64
@@ -317,7 +323,6 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 					return swapInfo, nil
 				}
 			} else {
-				// SELL: input = largest non-SOL the signer sent; output = largest SOL received
 				var inMint string
 				var inAmt uint64
 				for m, a := range totalsBySigner {
@@ -349,65 +354,205 @@ func (p *Parser) ProcessSwapData(swapDatas []SwapData) (*SwapInfo, error) {
 			// If we couldn't resolve, keep falling through to generic aggregation.
 		}
 
-		// If neither event nor discriminator path resolved, include Pump.fun legs (if any) into the generic path.
 		otherSwaps = append(otherSwaps, pumpfunSwaps...)
 	}
 
 	// Aggregate legs (Raydium/Orca/Meteora/Pump.fun AMM etc.)
 	if len(otherSwaps) > 0 {
-		var uniqueTokens []TokenTransfer
-		seenTokens := make(map[string]bool)
+		// Dedup real on-chain legs across decoders before summing.
+		seenPerLeg := make(map[string]bool)      // exact-leg dedup for totalsPerMint
+		totalsPerMint := make(map[string]uint64) // mint -> total amount
+		decimalsPerMint := make(map[string]uint8)
+		firstSeenOrder := make([]string, 0)
 
-		for _, sd := range otherSwaps {
-			if tr := getTransferFromSwapData(sd); tr != nil && !seenTokens[tr.mint] {
-				uniqueTokens = append(uniqueTokens, *tr)
-				seenTokens[tr.mint] = true
+		// Separate dedup map for signer-authorized outflow to avoid triple counting
+		seenSignerOut := make(map[string]bool)
+		signerOutByMint := make(map[string]uint64)
+
+		record := func(mint string, amt uint64, dec uint8, key string) {
+			if !seenPerLeg[key] {
+				if _, ok := totalsPerMint[mint]; !ok {
+					firstSeenOrder = append(firstSeenOrder, mint)
+				}
+				totalsPerMint[mint] += amt
+				seenPerLeg[key] = true
+			}
+			if _, ok := decimalsPerMint[mint]; !ok {
+				decimalsPerMint[mint] = dec
 			}
 		}
 
-		if len(uniqueTokens) >= 2 {
-			inputTransfer := uniqueTokens[0]
-			outputTransfer := uniqueTokens[len(uniqueTokens)-1]
-
-			seenInputs := make(map[string]bool)
-			seenOutputs := make(map[string]bool)
-			var totalInputAmount uint64
-			var totalOutputAmount uint64
-
-			for _, sd := range otherSwaps {
-				tr := getTransferFromSwapData(sd)
-				if tr == nil {
+		for _, sd := range otherSwaps {
+			switch v := sd.Data.(type) {
+			case *TransferCheck:
+				amt, err := strconv.ParseUint(v.Info.TokenAmount.Amount, 10, 64)
+				if err != nil {
 					continue
 				}
-				key := fmt.Sprintf("%d-%s", tr.amount, tr.mint)
-				if tr.mint == inputTransfer.mint && !seenInputs[key] {
-					totalInputAmount += tr.amount
-					seenInputs[key] = true
+				key := fmt.Sprintf("tc|%s|%s|%s|%s|%d", v.Info.Authority, v.Info.Source, v.Info.Destination, v.Info.Mint, amt)
+				record(v.Info.Mint, amt, v.Info.TokenAmount.Decimals, key)
+
+				if v.Info.Authority == signer.String() {
+					skey := key // same identity key for signer outflow
+					if !seenSignerOut[skey] {
+						signerOutByMint[v.Info.Mint] += amt
+						seenSignerOut[skey] = true
+					}
 				}
-				if tr.mint == outputTransfer.mint && !seenOutputs[key] {
-					totalOutputAmount += tr.amount
-					seenOutputs[key] = true
+
+			case *TransferData:
+				key := fmt.Sprintf("t|%s|%s|%s|%s|%d", v.Info.Authority, v.Info.Source, v.Info.Destination, v.Mint, v.Info.Amount)
+				record(v.Mint, v.Info.Amount, v.Decimals, key)
+
+				if v.Info.Authority == signer.String() {
+					if !seenSignerOut[key] {
+						signerOutByMint[v.Mint] += v.Info.Amount
+						seenSignerOut[key] = true
+					}
+				}
+
+			case *JupiterSwapEventData:
+				key := fmt.Sprintf("jpevt|%s|%d", v.InputMint.String(), v.InputAmount)
+				record(v.InputMint.String(), v.InputAmount, v.InputMintDecimals, key)
+
+			case *OKXSwapEventData:
+				key := fmt.Sprintf("okxevt|%s|%d", v.InputMint.String(), v.InputAmount)
+				record(v.InputMint.String(), v.InputAmount, v.InputDecimals, key)
+			}
+		}
+
+		if len(totalsPerMint) >= 2 {
+			solMintStr := NATIVE_SOL_MINT_PROGRAM_ID.String()
+
+			// Prefer signer-authorized outflow to decide direction when SOL involved.
+			if signerOutByMint[solMintStr] > 0 {
+				// choose a non-SOL mint as the other side (first-seen preference)
+				var otherMint string
+				for _, m := range firstSeenOrder {
+					if m != solMintStr {
+						otherMint = m
+						break
+					}
+				}
+				if otherMint != "" {
+					swapInfo.TokenInMint = NATIVE_SOL_MINT_PROGRAM_ID
+					// use exact signer-authorized sum (deduped) for SOL in
+					swapInfo.TokenInAmount = signerOutByMint[solMintStr]
+					swapInfo.TokenInDecimals = 9
+
+					swapInfo.TokenOutMint = solana.MustPublicKeyFromBase58(otherMint)
+					swapInfo.TokenOutAmount = totalsPerMint[otherMint]
+					swapInfo.TokenOutDecimals = decimalsPerMint[otherMint]
+
+					// AMMs list (unique)
+					seenAMMs := make(map[string]bool)
+					for _, sd := range otherSwaps {
+						if !seenAMMs[string(sd.Type)] {
+							swapInfo.AMMs = append(swapInfo.AMMs, string(sd.Type))
+							seenAMMs[string(sd.Type)] = true
+						}
+					}
+					swapInfo.Timestamp = time.Now()
+					p.adjustOrderBySolDelta(swapInfo)
+					return swapInfo, nil
 				}
 			}
 
-			swapInfo.TokenInMint = solana.MustPublicKeyFromBase58(inputTransfer.mint)
-			swapInfo.TokenInAmount = totalInputAmount
-			swapInfo.TokenInDecimals = inputTransfer.decimals
-			swapInfo.TokenOutMint = solana.MustPublicKeyFromBase58(outputTransfer.mint)
-			swapInfo.TokenOutAmount = totalOutputAmount
-			swapInfo.TokenOutDecimals = outputTransfer.decimals
-
-			seenAMMs := make(map[string]bool)
-			for _, sd := range otherSwaps {
-				if !seenAMMs[string(sd.Type)] {
-					swapInfo.AMMs = append(swapInfo.AMMs, string(sd.Type))
-					seenAMMs[string(sd.Type)] = true
+			// If no signer-based signal, try lamport delta when SOL is present.
+			if _, hasSOL := totalsPerMint[solMintStr]; hasSOL {
+				// pick any non-SOL mint
+				var otherMint string
+				for _, m := range firstSeenOrder {
+					if m != solMintStr {
+						otherMint = m
+						break
+					}
+				}
+				if otherMint != "" {
+					if delta, ok := p.lamportDeltaFor(signer); ok && delta != 0 {
+						if delta < 0 {
+							swapInfo.TokenInMint = NATIVE_SOL_MINT_PROGRAM_ID
+							swapInfo.TokenInAmount = totalsPerMint[solMintStr]
+							swapInfo.TokenInDecimals = 9
+							swapInfo.TokenOutMint = solana.MustPublicKeyFromBase58(otherMint)
+							swapInfo.TokenOutAmount = totalsPerMint[otherMint]
+							swapInfo.TokenOutDecimals = decimalsPerMint[otherMint]
+						} else {
+							swapInfo.TokenInMint = solana.MustPublicKeyFromBase58(otherMint)
+							swapInfo.TokenInAmount = totalsPerMint[otherMint]
+							swapInfo.TokenInDecimals = decimalsPerMint[otherMint]
+							swapInfo.TokenOutMint = NATIVE_SOL_MINT_PROGRAM_ID
+							swapInfo.TokenOutAmount = totalsPerMint[solMintStr]
+							swapInfo.TokenOutDecimals = 9
+						}
+						seenAMMs := make(map[string]bool)
+						for _, sd := range otherSwaps {
+							if !seenAMMs[string(sd.Type)] {
+								swapInfo.AMMs = append(swapInfo.AMMs, string(sd.Type))
+								seenAMMs[string(sd.Type)] = true
+							}
+						}
+						swapInfo.Timestamp = time.Now()
+						p.adjustOrderBySolDelta(swapInfo)
+						return swapInfo, nil
+					}
 				}
 			}
 
-			swapInfo.Timestamp = time.Now()
-			p.adjustOrderBySolDelta(swapInfo)
-			return swapInfo, nil
+			// Fallback to first/last heuristic (kept for backward safety)
+			uniqueTokens := make([]TokenTransfer, 0, len(firstSeenOrder))
+			for _, m := range firstSeenOrder {
+				uniqueTokens = append(uniqueTokens, TokenTransfer{
+					mint:     m,
+					amount:   totalsPerMint[m],
+					decimals: decimalsPerMint[m],
+				})
+			}
+			if len(uniqueTokens) >= 2 {
+				inputTransfer := uniqueTokens[0]
+				outputTransfer := uniqueTokens[len(uniqueTokens)-1]
+
+				// recompute totals specifically for chosen in/out with per-leg dedupe
+				seenInputs := make(map[string]bool)
+				seenOutputs := make(map[string]bool)
+				var totalInputAmount uint64
+				var totalOutputAmount uint64
+
+				for _, sd := range otherSwaps {
+					tr := getTransferFromSwapData(sd)
+					if tr == nil {
+						continue
+					}
+					key := fmt.Sprintf("%d-%s", tr.amount, tr.mint)
+					if tr.mint == inputTransfer.mint && !seenInputs[key] {
+						totalInputAmount += tr.amount
+						seenInputs[key] = true
+					}
+					if tr.mint == outputTransfer.mint && !seenOutputs[key] {
+						totalOutputAmount += tr.amount
+						seenOutputs[key] = true
+					}
+				}
+
+				swapInfo.TokenInMint = solana.MustPublicKeyFromBase58(inputTransfer.mint)
+				swapInfo.TokenInAmount = totalInputAmount
+				swapInfo.TokenInDecimals = inputTransfer.decimals
+				swapInfo.TokenOutMint = solana.MustPublicKeyFromBase58(outputTransfer.mint)
+				swapInfo.TokenOutAmount = totalOutputAmount
+				swapInfo.TokenOutDecimals = outputTransfer.decimals
+
+				seenAMMs := make(map[string]bool)
+				for _, sd := range otherSwaps {
+					if !seenAMMs[string(sd.Type)] {
+						swapInfo.AMMs = append(swapInfo.AMMs, string(sd.Type))
+						seenAMMs[string(sd.Type)] = true
+					}
+				}
+
+				swapInfo.Timestamp = time.Now()
+				p.adjustOrderBySolDelta(swapInfo)
+				return swapInfo, nil
+			}
 		}
 	}
 
