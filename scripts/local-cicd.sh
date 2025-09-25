@@ -19,6 +19,8 @@ fi
 : "${REMOTE_ARCHIVE:=txparser-amd64.tar}"
 : "${CASES_FILE:=tests/cases.json}"
 : "${PER_TEST_DELAY_SECONDS:=1}"
+: "${HOLDERS_FILE:=tests/holders.json}"
+: "${PER_HOLDER_DELAY_SECONDS:=1}"
 
 echo "==> Config"
 echo "ROOT_DIR=${ROOT_DIR}"
@@ -40,10 +42,17 @@ scp -q "${ROOT_DIR}/scripts/deploy-simple.sh" \
        "${ROOT_DIR}/scripts/deploy-bluegreen.sh" \
        "${VM_USER}@${VM_HOST}:/home/${VM_USER}/txparser/"
 
+# swap cases
 scp -q "${ROOT_DIR}/${CASES_FILE}" \
        "${VM_USER}@${VM_HOST}:/home/${VM_USER}/txparser/tests/cases.json"
 
-# NEW: sync .env so the container gets SOLANA_RPC_URL on the VM
+# holders cases (optional)
+if [[ -f "${ROOT_DIR}/${HOLDERS_FILE}" ]]; then
+  scp -q "${ROOT_DIR}/${HOLDERS_FILE}" \
+         "${VM_USER}@${VM_HOST}:/home/${VM_USER}/txparser/tests/holders.json"
+fi
+
+# sync .env so the container gets SOLANA_RPC_URL / *_FOR_COUNTER on the VM
 if [[ -f "${ROOT_DIR}/.env" ]]; then
   scp -q "${ROOT_DIR}/.env" \
     "${VM_USER}@${VM_HOST}:/home/${VM_USER}/txparser/.env"
@@ -66,6 +75,7 @@ if [[ "${DEPLOY_MODE}" == "bluegreen" ]]; then
   ssh "${VM_USER}@${VM_HOST}" "bash -s" <<EOF
 set -e
 export PER_TEST_DELAY_SECONDS="${PER_TEST_DELAY_SECONDS}"
+export PER_HOLDER_DELAY_SECONDS="${PER_HOLDER_DELAY_SECONDS}"
 sudo bash ~/txparser/deploy-bluegreen.sh "/home/${VM_USER}/${REMOTE_ARCHIVE}" "${LIVE_PORT}" "${STAGE_PORT}"
 EOF
 else

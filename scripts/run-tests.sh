@@ -48,6 +48,9 @@ CASES_FILE="${CASES_FILE:-tests/cases.json}"
 PER_TEST_DELAY_SECONDS="${PER_TEST_DELAY_SECONDS:-1}"
 MIN_PASS_PCT="${MIN_PASS_PCT:-50}"
 
+# Optional list of mints to sanity-check holders (>0)
+HOLDER_CASES_FILE="${HOLDER_CASES_FILE:-tests/holder_mints.json}"
+
 command -v docker >/dev/null 2>&1 || die "Docker not found in PATH."
 docker info >/dev/null 2>&1 || die "Docker daemon not reachable."
 command -v jq >/dev/null 2>&1 || die "jq is required for parsing ${CASES_FILE}."
@@ -143,6 +146,51 @@ for line in ${pairs}; do
 
   sleep "${PER_TEST_DELAY_SECONDS}"
 done
+
+# ---- Holder sanity (does NOT affect pass %; just info) ----
+if [ -f "${HOLDER_CASES_FILE}" ]; then
+  log "Validate holder counts > 0 for test mints (pacing ${PER_TEST_DELAY_SECONDS}s)"
+  holder_total=0
+  holder_ok=0
+
+  # Extract as array of strings: { "mints": [ "mint1", "mint2", ... ] }
+  # Ignore blanks safely; no unbound vars.
+  while IFS= read -r _mint; do
+    mint="$(printf '%s' "${_mint}" | tr -d '[:space:]')"
+    [ -n "${mint}" ] || continue
+    holder_total=$((holder_total+1))
+
+    tries=0
+    http=000
+    resp_file="$(mktemp)"
+    while : ; do
+      tries=$((tries+1))
+      http="$(curl -sS -o "${resp_file}" -w "%{http_code}" --max-time "${REQUEST_TIMEOUT_SECONDS}" \
+        "http://${HOST_IP}:${PORT}/holders?mint=${mint}" || echo 000)"
+      # retry a couple of times on 429/5xx
+      if echo "${http}" | grep -Eq '^(429|5..)$' && [ "${tries}" -lt 3 ]; then
+        sleep "${PER_TEST_DELAY_SECONDS}"
+        continue
+      fi
+      break
+    done
+
+    holders="$(jq -r '.holders // 0' "${resp_file}" 2>/dev/null || echo 0)"
+    rm -f "${resp_file}"
+
+    if [ "${holders}" -gt 0 ]; then
+      printf ' - %s ... OK (%s)\n' "${mint}" "${holders}"
+      holder_ok=$((holder_ok+1))
+    else
+      printf ' - %s ... FAIL (holders=%s, http=%s)\n' "${mint}" "${holders}" "${http}"
+    fi
+    sleep "${PER_TEST_DELAY_SECONDS}"
+  done < <(jq -r '.mints[]? // empty' "${HOLDER_CASES_FILE}")
+
+  log "Holder sanity: ${holder_ok}/${holder_total} mints had holders > 0 (not counted toward threshold)"
+else
+  log "Holder sanity: ${HOLDER_CASES_FILE} not found; skipping"
+fi
 
 # Summary & threshold
 if [ "${total}" -eq 0 ]; then

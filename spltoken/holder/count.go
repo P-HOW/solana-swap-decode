@@ -12,7 +12,7 @@ import (
 	"github.com/gagliardetto/solana-go/rpc"
 )
 
-// Env var name (exact string).
+// Env var name (exact string you asked for).
 const EnvRPCForCounter = "SOLANA_RPC_URL_FOR_COUNTER"
 
 // SPL program IDs.
@@ -28,10 +28,11 @@ type Result struct {
 	ProgramUsed   solana.PublicKey
 }
 
-// CountHoldersForMint reproduces the TS "auto" behavior and obeys:
-// 1) keep retrying up to 60 minutes on *rate-limit* errors;
-// 2) return immediately on any other error.
-func CountHoldersForMint(_ context.Context, mintBase58 string) (*Result, error) {
+// CountHoldersForMint reproduces the TS "auto" behavior.
+// Contract you requested:
+//   - This function will keep retrying rate-limits until it returns.
+//   - If a non-rate-limit fatal error occurs, it returns that error.
+func CountHoldersForMint(ctx context.Context, mintBase58 string) (*Result, error) {
 	mint, err := solana.PublicKeyFromBase58(mintBase58)
 	if err != nil {
 		return nil, fmt.Errorf("invalid mint: %w", err)
@@ -43,90 +44,62 @@ func CountHoldersForMint(_ context.Context, mintBase58 string) (*Result, error) 
 	client := rpc.New(rpcURL)
 
 	// Try Token first.
-	if r, err := countForProgram(mint, client, ProgramToken); err == nil && r.TotalAccounts > 0 {
+	if r, err := countForProgram(ctx, client, mint, ProgramToken); err == nil && r.TotalAccounts > 0 {
 		r.ProgramUsed = ProgramToken
 		return &r, nil
-	} else if err != nil {
+	} else if err != nil && !isMethodNotFound(err) && !isTokenScanUnavailable(err) {
 		return nil, fmt.Errorf("token scan error: %w", err)
 	}
 
 	// Then Token-2022.
-	if r, err := countForProgram(mint, client, ProgramToken2022); err == nil && r.TotalAccounts > 0 {
+	if r, err := countForProgram(ctx, client, mint, ProgramToken2022); err == nil && r.TotalAccounts > 0 {
 		r.ProgramUsed = ProgramToken2022
 		return &r, nil
-	} else if err != nil {
+	} else if err != nil && !isMethodNotFound(err) && !isTokenScanUnavailable(err) {
 		return nil, fmt.Errorf("token2022 scan error: %w", err)
 	}
 
-	// If neither program produced accounts and no non-rate-limit error occurred,
-	// return empty result.
+	// If both scans fail due to disabled index / method missing, return zeroes (same as TS "no token accounts found").
 	return &Result{Holders: 0, TotalAccounts: 0}, nil
 }
 
-// countForProgram performs filtered getProgramAccounts and parses JSON
-// like the TS script. It ignores the caller context and enforces its
-// own 60-minute retry window for *rate-limit* errors only.
-func countForProgram(mint solana.PublicKey, client *rpc.Client, programID solana.PublicKey) (Result, error) {
-	// Hard deadline: 60 minutes regardless of caller context.
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
-	defer cancel()
+// countForProgram performs filtered getProgramAccounts and parses JSON the same way as the TS script.
+func countForProgram(ctx context.Context, client *rpc.Client, mint solana.PublicKey, programID solana.PublicKey) (Result, error) {
+	var out rpc.GetProgramAccountsResult
+	var err error
 
-	var (
-		out rpc.GetProgramAccountsResult
-		err error
-	)
+	// jittered retry for transient rate limits
+	const maxAttempts = 8
+	const base = 250 * time.Millisecond
 
-	// Retry on *rate limit* only, up to 60 minutes.
-	backoff := 250 * time.Millisecond
-	maxBackoff := 30 * time.Second
-	start := time.Now()
-
-	for {
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		out, err = client.GetProgramAccountsWithOpts(
 			ctx,
 			programID,
 			&rpc.GetProgramAccountsOpts{
 				Filters: []rpc.RPCFilter{
-					{DataSize: tokenAcctDataSize}, // 165-byte token account
+					{DataSize: tokenAcctDataSize},
 					{Memcmp: &rpc.RPCFilterMemcmp{
-						Offset: 0,            // mint field offset in token account
-						Bytes:  mint.Bytes(), // first 32 bytes = mint
+						Offset: 0,
+						Bytes:  mint.Bytes(), // account.mint field
 					}},
 				},
-				Encoding:   solana.EncodingJSONParsed, // same as TS parsed path
+				Encoding:   solana.EncodingJSONParsed, // match TS
 				Commitment: rpc.CommitmentConfirmed,
 			},
 		)
-
 		if err == nil {
 			break
 		}
-
-		// Only *rate-limit* errors are retried; anything else returns immediately.
-		if !isRateLimited(err) {
+		// Only retry for throttling/busyness; bubble up all other errors.
+		if !(isRateLimited(err) || isTooManyRequests(err) || isServerBusy(err)) {
 			return Result{}, err
 		}
-
-		// 60-minute hard cap.
-		if time.Since(start) >= 60*time.Minute {
-			return Result{}, fmt.Errorf("rate-limited for 60m (timeout): %w", err)
-		}
-
-		// Backoff with jitter.
-		jitter := time.Duration(rand.Int63n(int64(backoff / 3)))
-		sleep := backoff + jitter
-		select {
-		case <-time.After(sleep):
-		case <-ctx.Done():
-			// Should only happen at the 60-minute boundary.
-			return Result{}, fmt.Errorf("context done while rate-limited: %w", ctx.Err())
-		}
-		if backoff < maxBackoff {
-			backoff *= 2
-			if backoff > maxBackoff {
-				backoff = maxBackoff
-			}
-		}
+		j := time.Duration(rand.Int63n(int64(150 * time.Millisecond)))
+		time.Sleep(base*time.Duration(attempt) + j)
+	}
+	if err != nil {
+		return Result{}, err
 	}
 
 	type parsedAccount struct {
@@ -170,10 +143,27 @@ func countForProgram(mint solana.PublicKey, client *rpc.Client, programID solana
 	}, nil
 }
 
-// ---- error helpers (string contains, case-insensitive) ----
+// ---- tiny error helpers (string contains, case-insensitive) ----
 
 func isRateLimited(err error) bool {
-	return containsAny(err, "rate limit", "rate-limited", "429", "too many requests", "retry later")
+	return containsAny(err, "rate limit", "rate-limited", "429", "too many requests")
+}
+func isTooManyRequests(err error) bool { return containsAny(err, "too many requests") }
+func isServerBusy(err error) bool {
+	return containsAny(err, "server busy", "try again later", "overloaded")
+}
+func isMethodNotFound(err error) bool { return containsAny(err, "method not found", "-32601") }
+
+// Many providers phrase this differently; make the detector broad:
+func isTokenScanUnavailable(err error) bool {
+	return containsAny(
+		err,
+		"excluded from account secondary indexes",
+		"secondary indexes are disabled",
+		"account indexes disabled",
+		"this rpc method unavailable for key",
+		"unsupported filters on this plan",
+	)
 }
 
 func containsAny(err error, subs ...string) bool {
@@ -196,7 +186,8 @@ func containsAny(err error, subs ...string) bool {
 				sb[i] += 'a' - 'A'
 			}
 		}
-		if indexOf(ls, string(sb)) >= 0 {
+		ns := string(sb)
+		if indexOf(ls, ns) >= 0 {
 			return true
 		}
 	}

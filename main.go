@@ -12,6 +12,7 @@ import (
 	"time"
 
 	solanaswapgo "github.com/franco-bianco/solanaswap-go/solanaswap-go"
+	holder "github.com/franco-bianco/solanaswap-go/spltoken/holder"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
 )
@@ -23,6 +24,17 @@ type parseReq struct {
 type parseResp struct {
 	Transaction interface{} `json:"transaction"`
 	SwapInfo    interface{} `json:"swapInfo"`
+}
+
+type holdersReq struct {
+	Mint string `json:"mint"`
+}
+
+type holdersResp struct {
+	Mint          string `json:"mint"`
+	Holders       int    `json:"holders"`
+	TotalAccounts int    `json:"totalAccounts"`
+	ProgramUsed   string `json:"programUsed,omitempty"`
 }
 
 type apiError struct {
@@ -80,7 +92,19 @@ func main() {
     </div>
     <button type="submit" style="padding: 8px 14px;">Parse</button>
   </form>
-  <p style="margin-top: 24px; color:#666;">This form issues a GET to <code>/parse?signature=...&pretty=1</code>.</p>
+
+  <h2 style="margin:32px 0 8px;">Holder Count</h2>
+  <form action="/holders" method="get">
+    <label>Mint Address<br>
+      <input name="mint" style="width: 100%; padding: 8px;" placeholder="Enter mint address">
+    </label>
+    <div style="margin: 12px 0;">
+      <label><input type="checkbox" name="pretty" value="1" checked> pretty</label>
+    </div>
+    <button type="submit" style="padding: 8px 14px;">Count Holders</button>
+  </form>
+
+  <p style="margin-top: 24px; color:#666;">This page issues GETs to <code>/parse?signature=...&pretty=1</code> and <code>/holders?mint=...&pretty=1</code>.</p>
 </div>
 `))
 	})
@@ -174,17 +198,61 @@ func main() {
 		}, pretty)
 	})
 
+	// Holder count endpoint (GET ?mint=... or POST {"mint": "..."}; supports &pretty=1)
+	http.HandleFunc("/holders", func(w http.ResponseWriter, r *http.Request) {
+		pretty := r.URL.Query().Get("pretty") == "1" || r.URL.Query().Get("pretty") == "true"
+
+		var mint string
+		switch r.Method {
+		case http.MethodPost:
+			var req holdersReq
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeJSONMaybePretty(w, http.StatusBadRequest, apiError{Error: "bad_request", Details: "invalid JSON body"}, pretty)
+				return
+			}
+			mint = strings.TrimSpace(req.Mint)
+		case http.MethodGet:
+			mint = strings.TrimSpace(r.URL.Query().Get("mint"))
+		default:
+			writeJSONMaybePretty(w, http.StatusMethodNotAllowed, apiError{Error: "method_not_allowed"}, pretty)
+			return
+		}
+
+		if mint == "" {
+			writeJSONMaybePretty(w, http.StatusBadRequest, apiError{Error: "bad_request", Details: "mint is required"}, pretty)
+			return
+		}
+
+		// Call the long-running counter (it manages its own 60m retry window on rate limits).
+		res, err := holder.CountHoldersForMint(context.Background(), mint)
+		if err != nil {
+			writeJSONMaybePretty(w, http.StatusBadGateway, apiError{Error: "holder_count_error", Details: err.Error()}, pretty)
+			return
+		}
+
+		resp := holdersResp{
+			Mint:          mint,
+			Holders:       res.Holders,
+			TotalAccounts: res.TotalAccounts,
+		}
+		if (res.ProgramUsed != solana.PublicKey{}) {
+			resp.ProgramUsed = res.ProgramUsed.String()
+		}
+		writeJSONMaybePretty(w, http.StatusOK, resp, pretty)
+	})
+
 	// HTTP server settings
 	addr := ":8080"
 	srv := &http.Server{
 		Addr:              addr,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		// Holder count can run up to 60 minutes; give some headroom:
+		WriteTimeout: 65 * time.Minute,
+		IdleTimeout:  65 * time.Minute,
 	}
 
-	log.Printf("listening on http://%s (rpc=%s, per-request timeout=%ss)",
-		addr, rpcURL, strconv.Itoa(int(rpcTimeout/time.Second)))
+	log.Printf("listening on http://%s (tx rpc=%s, per-request tx timeout=%ss; holders use %s)",
+		addr, rpcURL, strconv.Itoa(int(rpcTimeout/time.Second)), holder.EnvRPCForCounter)
 	log.Fatal(srv.ListenAndServe())
 }
