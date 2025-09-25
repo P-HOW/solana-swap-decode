@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -40,8 +41,13 @@ func writeJSONMaybePretty(w http.ResponseWriter, status int, v interface{}, pret
 }
 
 func main() {
-	// Helius RPC URL (hardcoded as requested)
-	rpcURL := "https://mainnet.helius-rpc.com/?api-key=f7aa96fd-2bb1-49ce-8468-894bcbb22551"
+	// Load RPC URL from environment (fallback keeps old behavior)
+	defaultRPC := "https://mainnet.helius-rpc.com/?api-key=f7aa96fd-2bb1-49ce-8468-894bcbb22551"
+	rpcURL := strings.TrimSpace(os.Getenv("SOLANA_RPC_URL"))
+	if rpcURL == "" {
+		rpcURL = defaultRPC
+	}
+
 	const rpcTimeout = 10 * time.Second
 
 	// Max transaction version

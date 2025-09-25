@@ -3,23 +3,17 @@
 # Exits 0 if pass % >= MIN_PASS_PCT (default 50), else 1.
 # Cleans up the temp container so 8080 is free for the real deploy.
 # macOS/Bash 3 compatible.
-
 set -Eeuo pipefail
 
 log() { printf '==> %s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
-await_health() {
-  # $1 host; $2 port; $3 timeout_secs
+await_health() { # $1 host; $2 port; $3 timeout_secs
   host="$1"; port="$2"; timeout="${3:-60}"
   end=$(( $(date +%s) + timeout ))
   while true; do
-    if curl -sSf "http://${host}:${port}/healthz" >/dev/null 2>&1; then
-      echo "ok"; return 0
-    fi
-    if [ "$(date +%s)" -ge "$end" ]; then
-      echo "timeout"; return 1
-    fi
+    if curl -sSf "http://${host}:${port}/healthz" >/dev/null 2>&1; then echo "ok"; return 0; fi
+    if [ "$(date +%s)" -ge "$end" ]; then echo "timeout"; return 1; fi
     sleep 1
   done
 }
@@ -49,7 +43,6 @@ IMAGE="txparser:test-local"
 TEST_CONTAINER="txparser-test-run"
 HOST_IP="127.0.0.1"
 PORT="8080"
-
 REQUEST_TIMEOUT_SECONDS="${REQUEST_TIMEOUT_SECONDS:-15}"
 CASES_FILE="${CASES_FILE:-tests/cases.json}"
 PER_TEST_DELAY_SECONDS="${PER_TEST_DELAY_SECONDS:-1}"
@@ -87,13 +80,16 @@ if port_in_use "${PORT}"; then
   die "Release 8080 and re-run."
 fi
 
-cleanup() {
-  docker rm -f "${TEST_CONTAINER}" >/dev/null 2>&1 || true
-}
+cleanup() { docker rm -f "${TEST_CONTAINER}" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 log "Run temp container on ${HOST_IP}:${PORT}"
-docker run -d --name "${TEST_CONTAINER}" -p ${HOST_IP}:${PORT}:8080 "${IMAGE}" >/dev/null
+ENV_ARGS=()
+if [ -f ".env" ]; then
+  ENV_ARGS=(--env-file ".env")
+fi
+
+docker run -d --name "${TEST_CONTAINER}" -p ${HOST_IP}:${PORT}:8080 "${ENV_ARGS[@]}" "${IMAGE}" >/dev/null
 
 log "Wait for health"
 if [ "$(await_health "${HOST_IP}" "${PORT}" 60)" != "ok" ]; then
@@ -103,7 +99,6 @@ if [ "$(await_health "${HOST_IP}" "${PORT}" 60)" != "ok" ]; then
 fi
 
 log "Validate swapInfo non-zero for test cases (pacing ${PER_TEST_DELAY_SECONDS}s)"
-
 # Try multiple layouts of cases.json:
 # 1) array of {name, signature}
 # 2) .cases[] of {name, signature}
@@ -127,23 +122,23 @@ passed=0
 IFS=$'\n'
 for line in ${pairs}; do
   name="$(printf '%s' "${line}" | awk -F'\t' '{print $1}')"
-  sig="$(printf  '%s' "${line}" | awk -F'\t' '{print $2}')"
+  sig="$(printf '%s' "${line}" | awk -F'\t' '{print $2}')"
   [ -n "${sig}" ] || continue
+
   total=$((total+1))
 
   # POST /parse
   json="$(curl -sS --max-time "${REQUEST_TIMEOUT_SECONDS}" -X POST "http://${HOST_IP}:${PORT}/parse" \
-           -H 'Content-Type: application/json' \
-           -d "{\"signature\":\"${sig}\"}" || true)"
+    -H 'Content-Type: application/json' \
+    -d "{\"signature\":\"${sig}\"}" || true)"
 
   # Consider pass if swapInfo object exists and is non-empty
   ok="$(printf '%s' "${json}" | jq -r 'if (.swapInfo | type=="object") and (.swapInfo | length>0) then "OK" else "FAIL" end' 2>/dev/null || echo FAIL)"
-
   if [ "${ok}" = "OK" ]; then
-    printf '  - %s ... OK\n' "${name}"
+    printf ' - %s ... OK\n' "${name}"
     passed=$((passed+1))
   else
-    printf '  - %s ... FAIL (empty swapInfo)\n' "${name}"
+    printf ' - %s ... FAIL (empty swapInfo)\n' "${name}"
   fi
 
   sleep "${PER_TEST_DELAY_SECONDS}"

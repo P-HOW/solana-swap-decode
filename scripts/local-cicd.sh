@@ -22,8 +22,8 @@ fi
 
 echo "==> Config"
 echo "ROOT_DIR=${ROOT_DIR}"
-echo "VM_HOST=${VM_HOST}  VM_USER=${VM_USER}"
-echo "LIVE_PORT=${LIVE_PORT}  STAGE_PORT=${STAGE_PORT}  MODE=${DEPLOY_MODE}"
+echo "VM_HOST=${VM_HOST} VM_USER=${VM_USER}"
+echo "LIVE_PORT=${LIVE_PORT} STAGE_PORT=${STAGE_PORT} MODE=${DEPLOY_MODE}"
 echo "REMOTE_ARCHIVE=${REMOTE_ARCHIVE}"
 
 echo "==> 1) run local tests"
@@ -35,11 +35,20 @@ echo "TAG=${TAG}"
 
 echo "==> 2.5) sync deploy scripts & test cases to VM"
 ssh -q "${VM_USER}@${VM_HOST}" "mkdir -p ~/txparser/tests"
+
 scp -q "${ROOT_DIR}/scripts/deploy-simple.sh" \
-        "${ROOT_DIR}/scripts/deploy-bluegreen.sh" \
-        "${VM_USER}@${VM_HOST}:/home/${VM_USER}/txparser/"
+       "${ROOT_DIR}/scripts/deploy-bluegreen.sh" \
+       "${VM_USER}@${VM_HOST}:/home/${VM_USER}/txparser/"
+
 scp -q "${ROOT_DIR}/${CASES_FILE}" \
-        "${VM_USER}@${VM_HOST}:/home/${VM_USER}/txparser/tests/cases.json"
+       "${VM_USER}@${VM_HOST}:/home/${VM_USER}/txparser/tests/cases.json"
+
+# NEW: sync .env so the container gets SOLANA_RPC_URL on the VM
+if [[ -f "${ROOT_DIR}/.env" ]]; then
+  scp -q "${ROOT_DIR}/.env" \
+    "${VM_USER}@${VM_HOST}:/home/${VM_USER}/txparser/.env"
+fi
+
 ssh -q "${VM_USER}@${VM_HOST}" "chmod +x ~/txparser/deploy-simple.sh ~/txparser/deploy-bluegreen.sh"
 
 echo "==> 3) preflight docker on VM"

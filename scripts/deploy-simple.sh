@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ARCHIVE="$1"          # /home/azureuser/txparser-amd64.tar
+ARCHIVE="$1" # /home/azureuser/txparser-amd64.tar
 LIVE_PORT="${2:-8080}"
 
 # ensure docker daemon is up
@@ -20,6 +20,13 @@ if [[ -z "${REF}" ]]; then
 fi
 echo "Using image: $REF"
 
+# optional env-file on the VM (synced by local-cicd.sh)
+ENV_FILE="$HOME/txparser/.env"
+ENV_ARGS=()
+if [[ -f "$ENV_FILE" ]]; then
+  ENV_ARGS=(--env-file "$ENV_FILE")
+fi
+
 echo "==> Stop & remove old"
 docker rm -f txparser >/dev/null 2>&1 || true
 
@@ -27,6 +34,7 @@ echo "==> Run new"
 docker run -d --name txparser \
   -p 0.0.0.0:${LIVE_PORT}:8080 \
   --restart unless-stopped \
+  "${ENV_ARGS[@]}" \
   "$REF"
 
 echo "==> Health"
