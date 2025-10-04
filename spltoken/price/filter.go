@@ -11,7 +11,6 @@ import (
 )
 
 // FilteredTx is the minimal payload your swap-decoder needs next.
-// (We keep it lean to avoid SDK-type pitfalls.)
 type FilteredTx struct {
 	Slot            uint64
 	BlockTime       int64               // unix seconds
@@ -29,10 +28,11 @@ func FilterTxsByMint(
 ) ([]*FilteredTx, error) {
 
 	blk, err := client.GetBlockWithOpts(ctx, slot, &rpc.GetBlockOpts{
-		// Encoding:   solana.EncodingBase64Zstd, // optional
-		Commitment:         rpc.CommitmentFinalized,
-		TransactionDetails: rpc.TransactionDetailsFull,
-		Rewards:            pointer.ToBool(false),
+		Commitment:                     rpc.CommitmentFinalized,
+		TransactionDetails:             rpc.TransactionDetailsFull,
+		Rewards:                        pointer.ToBool(false),
+		MaxSupportedTransactionVersion: pointer.ToUint64(0), // <-- IMPORTANT for most mainnet RPCs
+		// Encoding: solana.EncodingBase64Zstd, // optional
 	})
 	if err != nil {
 		return nil, fmt.Errorf("getBlock(%d): %w", slot, err)
@@ -109,7 +109,7 @@ func FilterTxsByMint(
 		}
 
 		out = append(out, &FilteredTx{
-			Slot:            slot,      // use the slot we queried
+			Slot:            slot,      // we know the slot we queried
 			BlockTime:       blockTime, // unix seconds
 			PerAccountDelta: perAcct,
 			TotalDelta:      total,
