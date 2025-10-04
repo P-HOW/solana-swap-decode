@@ -9,7 +9,7 @@ import (
 )
 
 func TestPricesAtSlot_371161375_DBONK(t *testing.T) {
-	// Reuse .env loader and RPC picker from filter_test.go
+	// Reuse helpers defined in filter_test.go
 	loadDotEnvNearRepoRoot(t)
 
 	rpcURL := pickRPCFromEnv()
@@ -27,21 +27,15 @@ func TestPricesAtSlot_371161375_DBONK(t *testing.T) {
 		t.Fatalf("GetPricesAtSlot error: %v", err)
 	}
 
-	t.Logf("slot=%d mint=%s -> %d price point(s)", slot, mint, len(points))
-	for i, pp := range points {
-		// Pretty one-liner with signature & time
-		t.Logf("[%d] %s", i, PrettyPrice(pp))
-
-		// Explicit price prints:
-		t.Logf("    price (SOL per %s): %.12f  (exact=%s)",
-			mint.String(), pp.PriceFloat, pp.PriceSOLPerToken.RatString())
-
-		// If you also want TOKEN per SOL (inverse), uncomment:
-		// inv := new(big.Rat).Inv(pp.PriceSOLPerToken)
-		// f, _ := inv.Float64()
-		// t.Logf("    price (TOK per 1 SOL): %.6f (exact=%s)", f, inv.RatString())
+	if len(points) == 0 {
+		t.Logf("slot=%d mint=%s -> 0 price points (likely no SOL pair or swapInfo was nil for all candidates)", slot, mint)
+		return
 	}
 
-	// Optional assertion if you expect ≥1 price point:
-	// if len(points) == 0 { t.Fatal("expected >=1 price point") }
+	t.Logf("slot=%d mint=%s -> %d price point(s)", slot, mint, len(points))
+	for i, pp := range points {
+		t.Logf("[%d] %s", i, PrettyPrice(pp))
+		t.Logf("    price (SOL per %s): %.12f  (exact=%s)",
+			mint.String(), pp.PriceFloat, pp.PriceSOLPerToken.RatString())
+	}
 }
