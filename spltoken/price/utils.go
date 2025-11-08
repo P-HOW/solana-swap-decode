@@ -3,207 +3,377 @@ package price
 import (
 	"context"
 	"errors"
-	"math"
-	"sort"
-	"time"
-
 	"github.com/gagliardetto/solana-go/rpc"
+	"math"
 )
 
-// avgSlotDuration is Solana’s nominal block time used only for an initial guess.
-const avgSlotDuration = 400 * time.Millisecond
+// ---------- small helpers ----------
 
-// SlotAtClosest finds the slot whose block time is closest to the given UNIX timestamp (seconds).
-// If two slots are exactly equidistant in time (extremely rare), tie will be non-nil and hold the
-// “other” slot; otherwise tie is nil. searchRadius caps the outward probing around the initial guess.
-//
-// Strategy:
-//  1. Seed with a guess using the nominal 400ms slot time.
-//  2. Probe outward from the guess (guess, guess-1, guess+1, guess-2, guess+2, …) up to searchRadius.
-//  3. Track the slot with the minimal |blockTime - tUnix|. If a probe has nil blockTime (skipped),
-//     it is ignored. Stop early if the absolute time deltas stop improving for a while.
-//
-// This keeps logic simple, avoids brittle binary-search pitfalls with skipped slots,
-// and is RPC-safe for modest radii.
-func SlotAtClosest(ctx context.Context, c *rpc.Client, tUnix int64, searchRadius uint64) (best uint64, tie *uint64, err error) {
-	if c == nil {
-		return 0, nil, errors.New("SlotAtClosest: nil rpc client")
+func absI64(x int64) int64 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// cappedAdd returns a+b but clamps within [0, max].
+func cappedAdd(a uint64, b int64, max uint64) uint64 {
+	if b == 0 {
+		return a
+	}
+	if b > 0 {
+		u := a + uint64(b)
+		if u < a { // overflow
+			return max
+		}
+		if u > max {
+			return max
+		}
+		return u
+	}
+	// b < 0
+	nb := uint64(-b)
+	if nb > a {
+		return 0
+	}
+	return a - nb
+}
+
+// ---------- main logic ----------
+
+// SlotAtClosest finds the slot whose block-time is closest to targetUnix.
+// It returns best, optional tie, and an error.
+// The search never uses firstSlot; instead it brackets around an estimated guess
+// with an adaptive window that doubles until time(lo) <= target <= time(hi).
+func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, maxProbes int) (best uint64, tie *uint64, err error) {
+	if maxProbes <= 0 {
+		maxProbes = 1024
 	}
 
-	// 1) Current finalized slot & time
-	sNow, err := c.GetSlot(ctx, rpc.CommitmentFinalized)
+	// 0) Edge: now slot/time
+	nowSlot, err := client.GetSlot(ctx, rpc.CommitmentFinalized)
 	if err != nil {
 		return 0, nil, err
 	}
-	btNowPtr, err := c.GetBlockTime(ctx, sNow)
-	if err != nil {
-		return 0, nil, err
-	}
-	if btNowPtr == nil {
-		// Extremely rare for the current finalized slot; just step back until we find one.
-		var found bool
-		for back := uint64(1); back <= 512; back++ {
-			if sNow < back {
-				break
-			}
-			bt, e := c.GetBlockTime(ctx, sNow-back)
-			if e == nil && bt != nil {
-				sNow -= back
-				btNowPtr = bt
-				found = true
-				break
-			}
-		}
-		if !found || btNowPtr == nil {
-			return 0, nil, errors.New("SlotAtClosest: could not find non-nil time for latest slot")
-		}
+	btNowPtr, err := client.GetBlockTime(ctx, nowSlot)
+	if err != nil || btNowPtr == nil {
+		return 0, nil, errors.New("failed to read block time for latest finalized slot")
 	}
 	btNow := int64(*btNowPtr)
 
-	// 2) Initial guess by nominal 400ms per slot (clamp to >= 1)
-	//    delta slots ~= (tNow - t) / 0.4s
-	deltaSlots := int64((time.Duration(btNow-tUnix) * time.Second) / avgSlotDuration)
-	var guess uint64
-	if deltaSlots >= 0 {
-		if uint64(deltaSlots) >= sNow {
-			guess = 1
+	if targetUnix <= 0 {
+		targetUnix = btNow
+	}
+	if targetUnix >= btNow {
+		// Target in the future (or exactly now): closest is nowSlot.
+		return nowSlot, nil, nil
+	}
+
+	// 1) Estimate slots/sec and an initial guess near target time.
+	guess, sps := estimateSlotGuess(ctx, client, nowSlot, btNow, targetUnix)
+
+	// 2) Build an initial window around guess using a % of lookback.
+	lookbackSec := float64(btNow - targetUnix)
+	if lookbackSec < 0 {
+		lookbackSec = 0
+	}
+	// Base window seconds: max( fewSeconds , 5% * lookbackSec )
+	const fewSeconds = 5.0
+	winSec := lookbackSec * 0.05
+	if winSec < fewSeconds {
+		winSec = fewSeconds
+	}
+	// Convert to slots (respect a minimum slots window).
+	minSlotsWindow := uint64(200) // floor to avoid tiny ranges for extreme near-now
+	spanSlots := uint64(math.Round(sps * winSec))
+	if spanSlots < minSlotsWindow {
+		spanSlots = minSlotsWindow
+	}
+	// Clamp span so we stay inside [0, nowSlot].
+	if spanSlots > nowSlot {
+		spanSlots = nowSlot
+	}
+
+	// Probe budget & getBlockTime helper.
+	getBT := func(slot uint64) (int64, bool) {
+		if maxProbes <= 0 {
+			return 0, false
+		}
+		maxProbes--
+		ptr, err := client.GetBlockTime(ctx, slot)
+		if err != nil || ptr == nil {
+			return 0, false
+		}
+		return int64(*ptr), true
+	}
+
+	// 3) Try to resolve guess time (may be nil on pruned RPCs).
+	tGuess, okGuess := getBT(guess)
+	if !okGuess {
+		// Light local nudge to find a nearby slot with time.
+		for _, step := range []uint64{50, 200, 1000, 5000} {
+			if guess >= step {
+				if tg, ok := getBT(guess - step); ok {
+					tGuess, okGuess = tg, true
+					guess = guess - step
+					break
+				}
+			}
+			if guess+step <= nowSlot {
+				if tg, ok := getBT(guess + step); ok {
+					tGuess, okGuess = tg, true
+					guess = guess + step
+					break
+				}
+			}
+		}
+	}
+
+	// 4) Adaptive bracketing:
+	//    Start with [guess - spanSlots, guess + spanSlots],
+	//    expand by doubling span until we satisfy time(lo) <= target <= time(hi).
+	var lo, hi uint64
+	var tLoOK, tHiOK bool
+	var tLo, tHi int64
+
+	expand := func(span uint64) (ok bool) {
+		lo = cappedAdd(guess, -int64(span), nowSlot)
+		hi = cappedAdd(guess, +int64(span), nowSlot)
+
+		// Try to get times at lo/hi; if nil, nudge locally a bit.
+		if tt, ok := getBT(lo); ok {
+			tLo, tLoOK = tt, true
 		} else {
-			guess = sNow - uint64(deltaSlots)
+			// small forward nudge
+			for _, step := range []uint64{1_000, 5_000, 25_000} {
+				if lo+step <= hi {
+					if tt, ok := getBT(lo + step); ok {
+						lo += step
+						tLo, tLoOK = tt, true
+						break
+					}
+				}
+			}
+		}
+		if tt, ok := getBT(hi); ok {
+			tHi, tHiOK = tt, true
+		} else {
+			// small backward nudge
+			for _, step := range []uint64{1_000, 5_000, 25_000} {
+				if hi > lo+step {
+					if tt, ok := getBT(hi - step); ok {
+						hi -= step
+						tHi, tHiOK = tt, true
+						break
+					}
+				}
+			}
+		}
+		if !tLoOK && !tHiOK {
+			return false
+		}
+		// If只有一侧有时间，也可能马上满足边界（下面会再处理）
+		return true
+	}
+
+	// First attempt with initial window.
+	if okGuess {
+		// If we already know side, shrink one edge:
+		if tGuess >= targetUnix {
+			lo, hi = 0, guess
+			tLoOK, tHiOK = false, true
+			tHi = tGuess
+		} else {
+			lo, hi = guess, nowSlot
+			tLoOK, tHiOK = true, false
+			tLo = tGuess
 		}
 	} else {
-		// target time is in the future vs btNow; push guess forward
-		guess = sNow + uint64(-deltaSlots)
-		if guess < sNow { // overflow guard (practically impossible)
-			guess = sNow
-		}
-	}
-	if guess == 0 {
-		guess = 1
+		// No guess time; start with symmetric window.
+		_ = expand(spanSlots)
 	}
 
-	type cand struct {
-		slot uint64
-		bt   int64 // unix seconds
-		dabs int64 // |bt - tUnix|
-	}
-
-	var bestCand *cand
-	var secondCand *cand
-
-	// Helper to probe a single slot (ignore if block time is nil or RPC fails).
-	probe := func(s uint64) {
-		if s == 0 {
-			return
-		}
-		btPtr, e := c.GetBlockTime(ctx, s)
-		if e != nil || btPtr == nil {
-			return
-		}
-		bt := int64(*btPtr)
-		d := bt - tUnix
-		if d < 0 {
-			d = -d
-		}
-		curr := cand{slot: s, bt: bt, dabs: d}
-		if bestCand == nil || curr.dabs < bestCand.dabs || (curr.dabs == bestCand.dabs && curr.slot < bestCand.slot) {
-			// Track second best for tie reporting
-			if bestCand != nil {
-				secondCand = bestCand
-			}
-			bestCand = &curr
-			return
-		}
-		// Maintain second-best (only for exact-tie detection)
-		if secondCand == nil || curr.dabs < secondCand.dabs || (curr.dabs == secondCand.dabs && curr.slot < secondCand.slot) {
-			// But do not overwrite if it equals the best slot
-			if bestCand == nil || curr.slot != bestCand.slot {
-				secondCand = &curr
+	// Expand until we bracket target or run out of probes.
+	// Bracket condition（在两端都有时间时）：tLo <= target <= tHi。
+	for tries := 0; tries < 32 && maxProbes > 0; tries++ {
+		// Ensure lo/hi have times by expanding if needed.
+		if !tLoOK || !tHiOK {
+			if !expand(spanSlots) {
+				// If even expansion can’t get either side, just break and fallback later.
+				break
 			}
 		}
-	}
 
-	// 3) Outward probing around the guess
-	probe(guess)
-	for step := uint64(1); step <= searchRadius; step++ {
-		// left
-		if guess > step {
-			probe(guess - step)
+		// If both ends have time, check if already bracketed.
+		if tLoOK && tHiOK {
+			// Order endpoints if mis-ordered.
+			if hi < lo {
+				lo, hi = hi, lo
+				tLo, tHi = tHi, tLo
+			}
+			if tLo <= targetUnix && targetUnix <= tHi {
+				break // bracketed!
+			}
+			// Otherwise move window outward depending on which side target falls.
+			if targetUnix < tLo {
+				// move window backward
+				newSpan := spanSlots * 2
+				if newSpan == 0 {
+					newSpan = spanSlots + 1
+				}
+				spanSlots = newSpan
+				// centered on lo
+				guess = lo
+				tGuess = tLo
+				okGuess = true
+				tLoOK, tHiOK = false, false
+				continue
+			} else if targetUnix > tHi {
+				// move window forward
+				newSpan := spanSlots * 2
+				if newSpan == 0 {
+					newSpan = spanSlots + 1
+				}
+				spanSlots = newSpan
+				// centered on hi
+				guess = hi
+				tGuess = tHi
+				okGuess = true
+				tLoOK, tHiOK = false, false
+				continue
+			}
+		} else {
+			// Only one side had time; double span to try to obtain the other side.
+			newSpan := spanSlots * 2
+			if newSpan == 0 {
+				newSpan = spanSlots + 1
+			}
+			spanSlots = newSpan
+			continue
 		}
-		// right
-		probe(guess + step)
 	}
 
-	if bestCand == nil {
-		return 0, nil, errors.New("SlotAtClosest: no slot with non-nil block time within search radius")
+	// If we still don’t have both endpoints/bracket, do best-effort from what we have.
+	if !(tLoOK && tHiOK) {
+		// Try to re-fetch once if budget allows.
+		if !tLoOK {
+			if tt, ok := getBT(lo); ok {
+				tLo, tLoOK = tt, true
+			}
+		}
+		if !tHiOK {
+			if tt, ok := getBT(hi); ok {
+				tHi, tHiOK = tt, true
+			}
+		}
+		// If只有一端可用，就用那一端；如果都没有，就用guess或now。
+		if tLoOK && !tHiOK {
+			return lo, nil, nil
+		}
+		if tHiOK && !tLoOK {
+			return hi, nil, nil
+		}
+		if okGuess {
+			return guess, nil, nil
+		}
+		return nowSlot, nil, nil
 	}
 
-	// Decide exact-tie
-	if secondCand != nil && secondCand.dabs == bestCand.dabs && secondCand.slot != bestCand.slot {
-		other := secondCand.slot
-		return bestCand.slot, &other, nil
+	// 5) Binary search within [lo, hi] using times.
+	//    Robust to occasional nils by nudging a bit.
+	for iter := 0; lo+1 < hi && iter < 64 && maxProbes > 0; iter++ {
+		mid := lo + (hi-lo)/2
+		tMid, okMid := getBT(mid)
+		if !okMid {
+			// Nudge to nearest direction where we have time at endpoints.
+			// Pick side by comparing |mid-lo| vs |hi-mid| in slots (drift toward closer side).
+			if (mid - lo) <= (hi - mid) {
+				// lean to lo side
+				if mid > lo {
+					hi = mid
+					tHi, tHiOK = tMid, false
+				} else {
+					lo = mid
+					tLo, tLoOK = tMid, false
+				}
+			} else {
+				// lean to hi side
+				if hi > mid {
+					lo = mid
+					tLo, tLoOK = tMid, false
+				} else {
+					hi = mid
+					tHi, tHiOK = tMid, false
+				}
+			}
+			continue
+		}
+		if tMid == targetUnix {
+			// Perfect hit; check neighbor for tie.
+			best = mid
+			if mid+1 <= hi {
+				if tNext, okN := getBT(mid + 1); okN && absI64(tNext-targetUnix) == 0 {
+					tie = new(uint64)
+					*tie = mid + 1
+				}
+			}
+			return best, tie, nil
+		}
+		if tMid < targetUnix {
+			lo, tLo, tLoOK = mid, tMid, true
+		} else {
+			hi, tHi, tHiOK = mid, tMid, true
+		}
 	}
-	return bestCand.slot, nil, nil
+
+	// 6) Pick the closer endpoint; handle exact tie.
+	dLo := absI64(tLo - targetUnix)
+	dHi := absI64(tHi - targetUnix)
+	if dLo < dHi {
+		return lo, nil, nil
+	}
+	if dHi < dLo {
+		return hi, nil, nil
+	}
+	// equidistant
+	res := lo
+	ti := hi
+	return res, &ti, nil
 }
 
-// VWAPWithLogFence computes a VWAP after filtering by:
-//   - dust threshold on weights (w >= minWeight),
-//   - symmetric log fence around the median with parameter r (>1): |ln(p) - ln(median)| <= ln(r).
-//
-// Returns (vwap, keptCount, weightSum, ok). If ok=false, no points passed the filters.
-func VWAPWithLogFence(values []float64, weights []float64, r float64, minWeight float64) (float64, int, float64, bool) {
-	n := len(values)
-	if n == 0 || n != len(weights) || r <= 1.0 {
-		return 0, 0, 0, false
-	}
-
-	// 1) dust filter
-	type pw struct{ p, w float64 }
-	f := make([]pw, 0, n)
-	for i := 0; i < n; i++ {
-		if !(weights[i] >= minWeight) || math.IsNaN(values[i]) || math.IsInf(values[i], 0) {
-			continue
+// estimateSlotGuess computes a first guess at the target slot and returns (guessSlot, slotsPerSecondUsed).
+// It prefers GetRecentPerformanceSamples; fallback is ~2.5 slots/sec.
+func estimateSlotGuess(ctx context.Context, client *rpc.Client, nowSlot uint64, btNow int64, targetUnix int64) (guess uint64, sps float64) {
+	limit := uint(60)
+	samples, err := client.GetRecentPerformanceSamples(ctx, &limit)
+	if err == nil && len(samples) > 0 {
+		var slots uint64
+		var secs uint64
+		for _, s := range samples {
+			secs += uint64(s.SamplePeriodSecs)
+			slots += uint64(s.NumSlots)
 		}
-		f = append(f, pw{p: values[i], w: weights[i]})
-	}
-	if len(f) == 0 {
-		return 0, 0, 0, false
-	}
-
-	// 2) median of prices (by value, unweighted)
-	ps := make([]float64, len(f))
-	for i := range f {
-		ps[i] = f[i].p
-	}
-	sort.Float64s(ps)
-	var med float64
-	m := len(ps)
-	if m%2 == 1 {
-		med = ps[m/2]
-	} else {
-		med = 0.5 * (ps[m/2-1] + ps[m/2])
-	}
-	if med <= 0 || math.IsNaN(med) || math.IsInf(med, 0) {
-		return 0, 0, 0, false
-	}
-
-	// 3) symmetric log fence
-	lnMed := math.Log(med)
-	lnR := math.Log(r)
-	sumW := 0.0
-	sumWP := 0.0
-	kept := 0
-	for _, x := range f {
-		if x.p <= 0 {
-			continue
-		}
-		if math.Abs(math.Log(x.p)-lnMed) <= lnR {
-			sumW += x.w
-			sumWP += x.w * x.p
-			kept++
+		if secs > 0 && slots > 0 {
+			sps = float64(slots) / float64(secs) // slots per second
 		}
 	}
-	if sumW <= 0 {
-		return 0, 0, 0, false
+
+	if sps == 0 {
+		sps = 2.5 // fallback heuristic
 	}
-	return sumWP / sumW, kept, sumW, true
+
+	dt := float64(btNow - targetUnix)
+	if dt < 0 {
+		dt = 0
+	}
+	est := float64(nowSlot) - sps*dt
+	if est < 0 {
+		est = 0
+	}
+	guess = uint64(math.Round(est))
+	// Clamp to [0, nowSlot]
+	if guess > nowSlot {
+		guess = nowSlot
+	}
+	return guess, sps
 }

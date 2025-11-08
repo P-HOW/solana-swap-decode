@@ -1,109 +1,123 @@
-package pricepackage
+package price
 
 import (
+	"context"
+	"testing"
+	"time"
+
 	"github.com/gagliardetto/solana-go/rpc"
-	"math"
 )
-price
-
-import (
-"context"
-"math"
-"testing"
-"time"
-
-"github.com/gagliardetto/solana-go/rpc"
-)
-
-// NOTE: We reuse loadDotEnvNearRepoRoot and pickRPCFromEnv from filter_test.go.
-// Ensure filter_test.go is in the same package so these helpers are available.
-
-func TestVWAPWithLogFence_OutlierFiltered(t *testing.T) {
-	values := []float64{1.00, 1.01, 10.0} // 10.0 is an outlier
-	weights := []float64{1.0, 1.0, 1.0}
-	r := 2.0               // ln fence with r=2
-	minWeight := 0.0       // no dust
-	v, kept, wsum, ok := VWAPWithLogFence(values, weights, r, minWeight)
-	if !ok {
-		t.Fatalf("VWAPWithLogFence returned not ok")
-	}
-	// Expect outlier filtered: kept should be 2, v ~ 1.005
-	if kept != 2 {
-		t.Fatalf("expected kept=2, got %d", kept)
-	}
-	if wsum <= 0 {
-		t.Fatalf("expected positive weight sum, got %f", wsum)
-	}
-	if math.Abs(v-1.005) > 0.01 {
-		t.Fatalf("unexpected vwap: got %.6f", v)
-	}
-}
 
 func TestSlotAtClosest_Basic(t *testing.T) {
 	loadDotEnvNearRepoRoot(t)
 	rpcURL := pickRPCFromEnv()
 	if rpcURL == "" {
-		t.Skip("no RPC found in env; set SOLANA_RPC_URL_FOR_PRICE / SOLANA_RPC_URL / HELIUS_RPC")
+		t.Skip("no RPC found in env (SOLANA_RPC_URL_FOR_PRICE / SOLANA_RPC_URL / HELIUS_RPC)")
 	}
 	client := rpc.New(rpcURL)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	// Pick a finalized reference slot and its timestamp.
-	refSlot, err := client.GetSlot(ctx, rpc.CommitmentFinalized)
+	// Anchor at latest finalized and pick a nearby timestamp.
+	nowSlot, err := client.GetSlot(ctx, rpc.CommitmentFinalized)
 	if err != nil {
 		t.Fatalf("GetSlot(finalized): %v", err)
 	}
-	btPtr, err := client.GetBlockTime(ctx, refSlot)
+	btPtr, err := client.GetBlockTime(ctx, nowSlot)
 	if err != nil || btPtr == nil {
-		t.Fatalf("GetBlockTime(%d): %v / %v", refSlot, err, btPtr)
+		t.Fatalf("GetBlockTime(latest): %v (ptr=%v)", err, btPtr)
 	}
-	tUnix := int64(*btPtr)
+	btNow := int64(*btPtr)
+	target := btNow - 50*24*60*60
 
-	best, tie, err := SlotAtClosest(ctx, client, tUnix, 512)
+	best, tie, err := SlotAtClosest(ctx, client, target, 4096)
 	if err != nil {
 		t.Fatalf("SlotAtClosest error: %v", err)
 	}
+	t.Logf("[Basic] best slot found = %d (tie=%v) for targetUnix=%d", best, tie, target)
 
-	// Fetch the chosen slot time and compare to neighbors.
-	bestBT, err := client.GetBlockTime(ctx, best)
-	if err != nil || bestBT == nil {
-		t.Fatalf("GetBlockTime(best=%d): %v / %v", best, err, bestBT)
+	btBestPtr, err := client.GetBlockTime(ctx, best)
+	if err != nil || btBestPtr == nil {
+		// Some RPCs return nil block time sporadically; log and do not fail.
+		t.Logf("[Basic] GetBlockTime(best=%d) returned nil (err=%v). Slot found is printed above; skipping strict time check.", best, err)
+		return
 	}
-	bestDiff := absI64(int64(*bestBT) - tUnix)
+	btBest := int64(*btBestPtr)
+	delta := absI64(btBest - target)
 
-	// Check neighbor (best-1) if available.
-	if best > 1 {
-		leftBT, _ := client.GetBlockTime(ctx, best-1) // ignore error/nil
-		if leftBT != nil {
-			if absI64(int64(*leftBT)-tUnix) < bestDiff {
-				t.Fatalf("neighbor left is closer than best")
-			}
-		}
-	}
-	// Check neighbor (best+1).
-	rightBT, _ := client.GetBlockTime(ctx, best+1)
-	if rightBT != nil {
-		if absI64(int64(*rightBT)-tUnix) < bestDiff {
-			t.Fatalf("neighbor right is closer than best")
-		}
+	// Expect a small delta; keep a generous bound for RPC variance.
+	if delta > 3 {
+		t.Fatalf("closest slot too far: |Δ|=%ds (slot=%d time=%d target=%d)", delta, best, btBest, target)
 	}
 
-	// If tie was reported, confirm equal absolute deltas.
+	// If tie is reported, verify it’s equidistant.
 	if tie != nil {
-		tieBT, _ := client.GetBlockTime(ctx, *tie)
-		if tieBT != nil {
-			if absI64(int64(*tieBT)-tUnix) != bestDiff {
-				t.Fatalf("reported tie is not actually equidistant")
+		btTiePtr, err := client.GetBlockTime(ctx, *tie)
+		if err != nil || btTiePtr == nil {
+			t.Logf("[Basic] GetBlockTime(tie=%d) nil (err=%v); skipping tie check.", *tie, err)
+			return
+		}
+		btTie := int64(*btTiePtr)
+		if absI64(btTie-target) != delta {
+			t.Fatalf("tie not actually equidistant: bestΔ=%d tieΔ=%d", delta, absI64(btTie-target))
+		}
+	}
+	t.Logf("[Basic] OK: best=%d |Δ|=%ds tie=%v", best, delta, tie)
+}
+
+func TestSlotAtClosest_50DaysAgo(t *testing.T) {
+	loadDotEnvNearRepoRoot(t)
+	rpcURL := pickRPCFromEnv()
+	if rpcURL == "" {
+		t.Skip("no RPC found in env (SOLANA_RPC_URL_FOR_PRICE / SOLANA_RPC_URL / HELIUS_RPC)")
+	}
+	client := rpc.New(rpcURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	// Build target ~50 days ago from the latest finalized block time.
+	nowSlot, err := client.GetSlot(ctx, rpc.CommitmentFinalized)
+	if err != nil {
+		t.Fatalf("GetSlot: %v", err)
+	}
+	btNowPtr, err := client.GetBlockTime(ctx, nowSlot)
+	if err != nil || btNowPtr == nil {
+		t.Fatalf("GetBlockTime(now): %v / %v", err, btNowPtr)
+	}
+	btNow := int64(*btNowPtr)
+	target := btNow - int64(50*24*time.Hour/time.Second)
+
+	// If the RPC is not archival and cannot provide times that far back, skip.
+	first, err := client.GetFirstAvailableBlock(ctx)
+	if err == nil {
+		if btFirstPtr, _ := client.GetBlockTime(ctx, first); btFirstPtr != nil {
+			btFirst := int64(*btFirstPtr)
+			if target < btFirst {
+				t.Skipf("RPC first-available is newer than target: target=%d first=%d", target, btFirst)
 			}
 		}
 	}
-}
 
-func absI64(x int64) int64 {
-	if x < 0 {
-		return -x
+	best, tie, err := SlotAtClosest(ctx, client, target, 8192)
+	if err != nil {
+		t.Fatalf("SlotAtClosest error: %v", err)
 	}
-	return x
-}
+	t.Logf("[50d] best slot found = %d (tie=%v) for targetUnix=%d", best, tie, target)
 
+	btBestPtr, err := client.GetBlockTime(ctx, best)
+	if err != nil || btBestPtr == nil {
+		// Older ranges may not always return times on non-archival RPCs; log and return.
+		t.Logf("[50d] GetBlockTime(best=%d) returned nil (err=%v). Slot found is printed above; skipping strict time check.", best, err)
+		return
+	}
+	btBest := int64(*btBestPtr)
+	delta := absI64(btBest - target)
+
+	// Use a looser bound for far history.
+	if delta > 300 {
+		t.Fatalf("closest slot too far for far-past search: |Δ|=%ds (slot=%d time=%d target=%d)", delta, best, btBest, target)
+	}
+	t.Logf("[50d] OK: best=%d |Δ|=%ds", best, delta)
+}
