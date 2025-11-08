@@ -3,8 +3,10 @@ package price
 import (
 	"context"
 	"errors"
-	"github.com/gagliardetto/solana-go/rpc"
 	"math"
+	"sort"
+
+	"github.com/gagliardetto/solana-go/rpc"
 )
 
 // ---------- small helpers ----------
@@ -39,7 +41,72 @@ func cappedAdd(a uint64, b int64, max uint64) uint64 {
 	return a - nb
 }
 
-// ---------- main logic ----------
+// ---------- VWAP utilities ----------
+
+// VWAPWithLogFence computes a VWAP after filtering by:
+//   - dust threshold on weights (w >= minWeight),
+//   - symmetric log fence around the median with parameter r (>1): |ln(p) - ln(median)| <= ln(r).
+//
+// Returns (vwap, keptCount, weightSum, ok). If ok=false, no points passed the filters.
+func VWAPWithLogFence(values []float64, weights []float64, r float64, minWeight float64) (float64, int, float64, bool) {
+	n := len(values)
+	if n == 0 || n != len(weights) || r <= 1.0 {
+		return 0, 0, 0, false
+	}
+
+	// 1) dust filter
+	type pw struct{ p, w float64 }
+	f := make([]pw, 0, n)
+	for i := 0; i < n; i++ {
+		if !(weights[i] >= minWeight) || math.IsNaN(values[i]) || math.IsInf(values[i], 0) {
+			continue
+		}
+		f = append(f, pw{p: values[i], w: weights[i]})
+	}
+	if len(f) == 0 {
+		return 0, 0, 0, false
+	}
+
+	// 2) median of prices (by value, unweighted)
+	ps := make([]float64, len(f))
+	for i := range f {
+		ps[i] = f[i].p
+	}
+	sort.Float64s(ps)
+	var med float64
+	m := len(ps)
+	if m%2 == 1 {
+		med = ps[m/2]
+	} else {
+		med = 0.5 * (ps[m/2-1] + ps[m/2])
+	}
+	if med <= 0 || math.IsNaN(med) || math.IsInf(med, 0) {
+		return 0, 0, 0, false
+	}
+
+	// 3) symmetric log fence
+	lnMed := math.Log(med)
+	lnR := math.Log(r)
+	sumW := 0.0
+	sumWP := 0.0
+	kept := 0
+	for _, x := range f {
+		if x.p <= 0 {
+			continue
+		}
+		if math.Abs(math.Log(x.p)-lnMed) <= lnR {
+			sumW += x.w
+			sumWP += x.w * x.p
+			kept++
+		}
+	}
+	if sumW <= 0 {
+		return 0, 0, 0, false
+	}
+	return sumWP / sumW, kept, sumW, true
+}
+
+// ---------- time→slot search (optimized/bracketing) ----------
 
 // SlotAtClosest finds the slot whose block-time is closest to targetUnix.
 // It returns best, optional tie, and an error.
@@ -129,9 +196,7 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 		}
 	}
 
-	// 4) Adaptive bracketing:
-	//    Start with [guess - spanSlots, guess + spanSlots],
-	//    expand by doubling span until we satisfy time(lo) <= target <= time(hi).
+	// 4) Adaptive bracketing.
 	var lo, hi uint64
 	var tLoOK, tHiOK bool
 	var tLo, tHi int64
@@ -144,7 +209,6 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 		if tt, ok := getBT(lo); ok {
 			tLo, tLoOK = tt, true
 		} else {
-			// small forward nudge
 			for _, step := range []uint64{1_000, 5_000, 25_000} {
 				if lo+step <= hi {
 					if tt, ok := getBT(lo + step); ok {
@@ -158,7 +222,6 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 		if tt, ok := getBT(hi); ok {
 			tHi, tHiOK = tt, true
 		} else {
-			// small backward nudge
 			for _, step := range []uint64{1_000, 5_000, 25_000} {
 				if hi > lo+step {
 					if tt, ok := getBT(hi - step); ok {
@@ -172,13 +235,10 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 		if !tLoOK && !tHiOK {
 			return false
 		}
-		// If只有一侧有时间，也可能马上满足边界（下面会再处理）
 		return true
 	}
 
-	// First attempt with initial window.
 	if okGuess {
-		// If we already know side, shrink one edge:
 		if tGuess >= targetUnix {
 			lo, hi = 0, guess
 			tLoOK, tHiOK = false, true
@@ -189,53 +249,41 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 			tLo = tGuess
 		}
 	} else {
-		// No guess time; start with symmetric window.
 		_ = expand(spanSlots)
 	}
 
-	// Expand until we bracket target or run out of probes.
-	// Bracket condition（在两端都有时间时）：tLo <= target <= tHi。
 	for tries := 0; tries < 32 && maxProbes > 0; tries++ {
-		// Ensure lo/hi have times by expanding if needed.
 		if !tLoOK || !tHiOK {
 			if !expand(spanSlots) {
-				// If even expansion can’t get either side, just break and fallback later.
 				break
 			}
 		}
 
-		// If both ends have time, check if already bracketed.
 		if tLoOK && tHiOK {
-			// Order endpoints if mis-ordered.
 			if hi < lo {
 				lo, hi = hi, lo
 				tLo, tHi = tHi, tLo
 			}
 			if tLo <= targetUnix && targetUnix <= tHi {
-				break // bracketed!
+				break
 			}
-			// Otherwise move window outward depending on which side target falls.
 			if targetUnix < tLo {
-				// move window backward
 				newSpan := spanSlots * 2
 				if newSpan == 0 {
 					newSpan = spanSlots + 1
 				}
 				spanSlots = newSpan
-				// centered on lo
 				guess = lo
 				tGuess = tLo
 				okGuess = true
 				tLoOK, tHiOK = false, false
 				continue
 			} else if targetUnix > tHi {
-				// move window forward
 				newSpan := spanSlots * 2
 				if newSpan == 0 {
 					newSpan = spanSlots + 1
 				}
 				spanSlots = newSpan
-				// centered on hi
 				guess = hi
 				tGuess = tHi
 				okGuess = true
@@ -243,7 +291,6 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 				continue
 			}
 		} else {
-			// Only one side had time; double span to try to obtain the other side.
 			newSpan := spanSlots * 2
 			if newSpan == 0 {
 				newSpan = spanSlots + 1
@@ -253,9 +300,7 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 		}
 	}
 
-	// If we still don’t have both endpoints/bracket, do best-effort from what we have.
 	if !(tLoOK && tHiOK) {
-		// Try to re-fetch once if budget allows.
 		if !tLoOK {
 			if tt, ok := getBT(lo); ok {
 				tLo, tLoOK = tt, true
@@ -266,7 +311,6 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 				tHi, tHiOK = tt, true
 			}
 		}
-		// If只有一端可用，就用那一端；如果都没有，就用guess或now。
 		if tLoOK && !tHiOK {
 			return lo, nil, nil
 		}
@@ -279,16 +323,12 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 		return nowSlot, nil, nil
 	}
 
-	// 5) Binary search within [lo, hi] using times.
-	//    Robust to occasional nils by nudging a bit.
+	// 5) Binary search within [lo, hi].
 	for iter := 0; lo+1 < hi && iter < 64 && maxProbes > 0; iter++ {
 		mid := lo + (hi-lo)/2
 		tMid, okMid := getBT(mid)
 		if !okMid {
-			// Nudge to nearest direction where we have time at endpoints.
-			// Pick side by comparing |mid-lo| vs |hi-mid| in slots (drift toward closer side).
 			if (mid - lo) <= (hi - mid) {
-				// lean to lo side
 				if mid > lo {
 					hi = mid
 					tHi, tHiOK = tMid, false
@@ -297,7 +337,6 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 					tLo, tLoOK = tMid, false
 				}
 			} else {
-				// lean to hi side
 				if hi > mid {
 					lo = mid
 					tLo, tLoOK = tMid, false
@@ -309,7 +348,6 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 			continue
 		}
 		if tMid == targetUnix {
-			// Perfect hit; check neighbor for tie.
 			best = mid
 			if mid+1 <= hi {
 				if tNext, okN := getBT(mid + 1); okN && absI64(tNext-targetUnix) == 0 {
@@ -326,7 +364,6 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 		}
 	}
 
-	// 6) Pick the closer endpoint; handle exact tie.
 	dLo := absI64(tLo - targetUnix)
 	dHi := absI64(tHi - targetUnix)
 	if dLo < dHi {
@@ -335,7 +372,6 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 	if dHi < dLo {
 		return hi, nil, nil
 	}
-	// equidistant
 	res := lo
 	ti := hi
 	return res, &ti, nil
@@ -357,7 +393,6 @@ func estimateSlotGuess(ctx context.Context, client *rpc.Client, nowSlot uint64, 
 			sps = float64(slots) / float64(secs) // slots per second
 		}
 	}
-
 	if sps == 0 {
 		sps = 2.5 // fallback heuristic
 	}
@@ -371,7 +406,6 @@ func estimateSlotGuess(ctx context.Context, client *rpc.Client, nowSlot uint64, 
 		est = 0
 	}
 	guess = uint64(math.Round(est))
-	// Clamp to [0, nowSlot]
 	if guess > nowSlot {
 		guess = nowSlot
 	}
