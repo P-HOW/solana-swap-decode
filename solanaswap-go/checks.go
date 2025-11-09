@@ -1,3 +1,4 @@
+// checks.go
 package solanaswapgo
 
 import (
@@ -52,6 +53,8 @@ func (p *Parser) isTransferCheck(instr solana.CompiledInstruction) bool {
 	return true
 }
 
+// (existing) pump/jup discriminators...
+
 func (p *Parser) isPumpFunTradeEventInstruction(inst solana.CompiledInstruction) bool {
 	if !p.allAccountKeys[inst.ProgramIDIndex].Equals(PUMP_FUN_PROGRAM_ID) || len(inst.Data) == 0 {
 		return false
@@ -81,3 +84,9 @@ func (p *Parser) isJupiterRouteEventInstruction(inst solana.CompiledInstruction)
 	}
 	return bytes.Equal(decodedBytes[:16], JupiterRouteEventDiscriminator[:])
 }
+
+// -------- NEW: tiny wrappers so users can call from checks.go if they prefer -----
+
+// LiquidityAdd/Remove detectors (delegates to liquidity_ops.go)
+func (p *Parser) IsAddLiquidity() bool    { return p.IsAddLiquidityTx() }
+func (p *Parser) IsRemoveLiquidity() bool { return p.IsRemoveLiquidityTx() }

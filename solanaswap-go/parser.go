@@ -74,6 +74,14 @@ type SwapData struct {
 
 // Jupiter is treated like a router only if we actually parse something under it.
 func (p *Parser) ParseTransaction() ([]SwapData, error) {
+
+	// >>> Early filter: ignore add/remove-liquidity txs entirely (before any analysis)
+	switch p.DetectLiquidityOp() {
+	case LiquidityAdd, LiquidityRemove:
+		// Optional: p.Log.Debugf("liquidity tx detected; skipping")
+		return nil, nil
+	}
+
 	var parsedSwaps []SwapData
 
 	skip := false
