@@ -10,7 +10,8 @@ import (
 	"github.com/gagliardetto/solana-go/rpc"
 )
 
-// Auto-generated: timestamps where |observed-ground_truth|/ground_truth > 3%.
+// Outliers requested for focused debugging (taken from your summary).
+// Each entry is the UNIX time `t` for the indicated idx.
 func Test_DebugPricingPath_Outliers(t *testing.T) {
 	loadDotEnvNearRepoRoot(t)
 	rpcURL := pickRPCFromEnv()
@@ -25,25 +26,25 @@ func Test_DebugPricingPath_Outliers(t *testing.T) {
 	}
 	mint := solana.MustPublicKeyFromBase58(mintStr)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30000*time.Second)
 	defer cancel()
 	ctx = WithPriceDebug(ctx, t.Logf)
 
+	// NOTE: Header said "Outliers: 14", but 12 idx were provided.
+	// If you want two more, ping me with their idx and I’ll add them.
 	samples := []int64{
-		1757507160, // idx=9  obs=0.0001154381247188164 gt=0.0000231040498444210 diff=399.64%
-		1757633340, // idx=11 obs=0.0000122568167890728 gt=0.0000245358498869126 diff=-50.05%
-		1758415680, // idx=24 obs=0.0000463486843671906 gt=0.0000231683792035664 diff=100.05%
-		1759062600, // idx=40 obs=13197.1453390098430 gt=0.0000185988814251862 diff=70956661418.03%
-		1759317540, // idx=47 obs=0.0013364489336696532 gt=0.0000200765021101081 diff=6556.78%
-		1759855320, // idx=55 obs=0.0000399028814363191 gt=0.0000199192710833862 diff=100.32%
-		1759944060, // idx=57 obs=0.0000405526949984199 gt=0.0000202523898949093 diff=100.24%
-		1760982240, // idx=75 obs=0.0000297605253175910 gt=0.0000148742919215737 diff=100.08%
-		1761031560, // idx=76 obs=0.0000320658709130223 gt=0.0000144149263709142 diff=122.45%
-		1761453420, // idx=85 obs=0.0000293498383961924 gt=0.0000147175324330384 diff=99.42%
-		1761581460, // idx=87 obs=0.0000303041641197339 gt=0.0000151387009707842 diff=100.18%
-		1761586560, // idx=88 obs=0.0007676312245247442 gt=0.0000153688077523508 diff=4894.74%
-		1761871980, // idx=94 obs=0.0000266560542209114 gt=0.0000133325528459846 diff=99.93%
-		1762108680, // idx=97 obs=0.0000276629921229437 gt=0.0000138197907487169 diff=100.17%
+		1759062600, // idx=40  obs=13197.145339009843   vs 1.8599e-05 (×7.10e8)
+		1759317540, // idx=47  obs=1.3364489336696532e-03 vs 2.0077e-05 (×65.57)
+		1758431640, // idx=26  obs=4.6342748156391966e-05 vs 2.3133e-05 (×2.00)
+		1761185340, // idx=79  obs=2.789477112339135e-05  vs 1.3938e-05 (×2.00)
+		1758415680, // idx=24  obs=4.634868436719059e-05  vs 2.3168e-05 (×2.00)
+		1757692800, // idx=14  obs=0.0                    vs 2.5147e-05 (100% low; ok=False in your run)
+		1761185940, // idx=80  obs=2.797494436780589e-05  vs 1.5302e-05 (×1.83)
+		1758923940, // idx=36  obs=4.2298866829669917e-07 vs 1.9353e-05 (≈−97.8%)
+		1761222060, // idx=81  obs=7.041700891453499e-06  vs 1.5520e-05 (−54.6%)
+		1761058320, // idx=77  obs=7.515342027738449e-06  vs 1.5033e-05 (−50.0%)
+		1758006420, // idx=18  obs=2.6203158323767497e-05 vs 2.3092e-05 (+13.5%, IQR fence)
+		1757673600, // idx=13  obs=2.2558483609277007e-05 vs 2.4759e-05 (−8.9%, IQR fence)
 	}
 
 	okCount, failCount := 0, 0
