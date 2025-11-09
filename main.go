@@ -56,13 +56,13 @@ func writeJSONMaybePretty(w http.ResponseWriter, status int, v interface{}, pret
 
 func main() {
 	// Load RPC URL from environment (fallback keeps old behavior)
-	defaultRPC := "https://mainnet.helius-rpc.com/?api-key=f7aa96fd-2bb1-49ce-8468-894bcbb22551"
+	defaultRPC := "https://solana-mainnet.core.chainstack.com/05e3ef92e44f0cdd09e9c644adb06270"
 	rpcURL := strings.TrimSpace(os.Getenv("SOLANA_RPC_URL"))
 	if rpcURL == "" {
 		rpcURL = defaultRPC
 	}
 
-	const rpcTimeout = 10 * time.Second
+	const rpcTimeout = 600 * time.Second
 
 	// Max transaction version
 	var maxTxVersionU64 uint64 = 0

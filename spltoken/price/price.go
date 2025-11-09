@@ -157,6 +157,9 @@ func GetPricesAtSlot(
 			continue
 		}
 
+		// --- STRICT GUARD AGAINST INTERMEDIARY ROUTES ---
+		// Only price this tx if the target mint is EXACTLY token-in OR token-out of the priced leg.
+		// If the swap used the target as a routing hop (e.g., WSOL→BONK→USDC), skip.
 		js, err := json.Marshal(swapInfo)
 		if err != nil {
 			dbg(ctx, "[price] sig=%s: marshal swapInfo err=%v", ft.Signature.String(), err)
@@ -199,7 +202,8 @@ func GetPricesAtSlot(
 			target = leg{mint: outMint, amount: sum.TokenOutAmount, decimals: sum.TokenOutDecimals}
 			counter = leg{mint: inMint, amount: sum.TokenInAmount, decimals: sum.TokenInDecimals}
 		default:
-			dbg(ctx, "[price] sig=%s: target not in {TokenIn,TokenOut}; skip", ft.Signature.String())
+			// >>> This is the critical skip to avoid pricing routed (intermediary) usage of the token.
+			dbg(ctx, "[price] sig=%s: target not in {TokenIn,TokenOut}; treated as routing hop → skip", ft.Signature.String())
 			continue
 		}
 
@@ -266,6 +270,7 @@ func GetPricesAtSlot(
 			priceUSD = ps * solUSD
 			dbg(ctx, "[price] sig=%s: SOL pair → SOLUSD=%.6f priceUSD≈%.10f", ft.Signature.String(), solUSD, priceUSD)
 		default:
+			// If the counter is neither SOL nor a known stable, we don't have a clean USD leg → skip.
 			dbg(ctx, "[price] sig=%s: counter not SOL/USDC/USDT (%s); skip", ft.Signature.String(), counter.mint)
 			continue
 		}
