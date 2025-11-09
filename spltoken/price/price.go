@@ -102,21 +102,31 @@ func GetPricesAtSlot(
 ) ([]PricePoint, error) {
 
 	// 1) Pre-filter candidates that change target-mint balances.
+	dbg(ctx, "[price] GetPricesAtSlot: slot=%d target=%s", slot, targetMint.String())
 	filtered, err := FilterTxsByMint(ctx, client, slot, targetMint)
 	if err != nil {
 		return nil, fmt.Errorf("FilterTxsByMint: %w", err)
 	}
 	if len(filtered) == 0 {
+		dbg(ctx, "[price] slot=%d: no txs changed target mint; returning 0 points", slot)
 		return nil, nil
 	}
 
 	usdcMint, usdtMint := mustStableMintsFromEnv()
+	if usdcMint == (solana.PublicKey{}) {
+		dbg(ctx, "[price] WARNING: SOLANA_USDC_CONTRACT_ADDRESS is not set/invalid; USDC pairs will NOT be counted")
+	}
+	if usdtMint == (solana.PublicKey{}) {
+		dbg(ctx, "[price] WARNING: SOLANA_USDT_CONTRACT_ADDRESS is not set/invalid; USDT pairs will NOT be counted")
+	}
+
 	points := make([]PricePoint, 0, len(filtered))
 	var maxTxVer uint64 = 0
 	cache := &solUSDCacher{}
 
 	for _, ft := range filtered {
 		if ft.Signature == nil {
+			dbg(ctx, "[price] slot=%d: skip tx (no signature)", slot)
 			continue
 		}
 
@@ -125,30 +135,36 @@ func GetPricesAtSlot(
 			MaxSupportedTransactionVersion: &maxTxVer,
 		})
 		if err != nil || tx == nil {
+			dbg(ctx, "[price] sig=%s: GetTransaction err=%v/tx=nil", ft.Signature.String(), err)
 			continue
 		}
 
 		parser, err := solanaswapgo.NewTransactionParser(tx)
 		if err != nil {
+			dbg(ctx, "[price] sig=%s: NewTransactionParser err=%v", ft.Signature.String(), err)
 			continue
 		}
 
 		txData, err := parser.ParseTransaction()
 		if err != nil {
+			dbg(ctx, "[price] sig=%s: ParseTransaction err=%v", ft.Signature.String(), err)
 			continue
 		}
 
 		swapInfo, err := parser.ProcessSwapData(txData)
 		if err != nil || swapInfo == nil {
+			dbg(ctx, "[price] sig=%s: ProcessSwapData err=%v swapInfo=nil? %v", ft.Signature.String(), err, swapInfo == nil)
 			continue
 		}
 
 		js, err := json.Marshal(swapInfo)
 		if err != nil {
+			dbg(ctx, "[price] sig=%s: marshal swapInfo err=%v", ft.Signature.String(), err)
 			continue
 		}
 		var sum swapSummary
 		if err := json.Unmarshal(js, &sum); err != nil {
+			dbg(ctx, "[price] sig=%s: unmarshal summary err=%v", ft.Signature.String(), err)
 			continue
 		}
 
@@ -161,6 +177,11 @@ func GetPricesAtSlot(
 		targetStr := targetMint.String()
 		inMint := sum.TokenInMint
 		outMint := sum.TokenOutMint
+		dbg(ctx, "[price] sig=%s: in=%s amt=%d dec=%d | out=%s amt=%d dec=%d | target=%s",
+			ft.Signature.String(),
+			inMint, sum.TokenInAmount, sum.TokenInDecimals,
+			outMint, sum.TokenOutAmount, sum.TokenOutDecimals,
+			targetStr)
 
 		// Identify which leg is the target and which is the counter/base
 		type leg struct {
@@ -178,7 +199,7 @@ func GetPricesAtSlot(
 			target = leg{mint: outMint, amount: sum.TokenOutAmount, decimals: sum.TokenOutDecimals}
 			counter = leg{mint: inMint, amount: sum.TokenInAmount, decimals: sum.TokenInDecimals}
 		default:
-			// Not a direct pair touching the target as in/out (shouldn't happen due to filter); skip defensively.
+			dbg(ctx, "[price] sig=%s: target not in {TokenIn,TokenOut}; skip", ft.Signature.String())
 			continue
 		}
 
@@ -188,6 +209,9 @@ func GetPricesAtSlot(
 		isUSDT := usdtMint.String() != "" && strings.EqualFold(counter.mint, usdtMint.String())
 		isStable := isUSDC || isUSDT
 
+		dbg(ctx, "[price] sig=%s: counter=%s → isSOL=%v isUSDC=%v isUSDT=%v isStable=%v",
+			ft.Signature.String(), counter.mint, isSOL, isUSDC, isUSDT, isStable)
+
 		// Compute token qty (UI units)
 		tokQty := new(big.Rat).SetFrac(
 			new(big.Int).SetUint64(target.amount),
@@ -195,6 +219,7 @@ func GetPricesAtSlot(
 		)
 		tokQtyF, _ := new(big.Rat).Set(tokQty).Float64()
 		if tokQtyF <= 0 {
+			dbg(ctx, "[price] sig=%s: targetQty<=0; skip", ft.Signature.String())
 			continue
 		}
 
@@ -203,7 +228,6 @@ func GetPricesAtSlot(
 		var priceSOLFloat float64
 		var solBase uint64
 		if isSOL {
-			// (SOL per token) = (counter.lamports / 1e9) / tokQty
 			lamports := new(big.Rat).SetFrac(
 				new(big.Int).SetUint64(counter.amount),
 				big.NewInt(1_000_000_000),
@@ -211,27 +235,26 @@ func GetPricesAtSlot(
 			priceSOL = new(big.Rat).Quo(lamports, tokQty)
 			priceSOLFloat, _ = new(big.Rat).Set(priceSOL).Float64()
 			solBase = counter.amount
+			dbg(ctx, "[price] sig=%s: SOL pair → priceSOL≈%.10f", ft.Signature.String(), priceSOLFloat)
 		}
 
 		// Compute USD price per token (supports SOL or stable counter only)
 		var priceUSD float64
 		switch {
 		case isStable:
-			// USD per token = (counter.amount / 10^counter.decimals) / tokQty
 			counterF := new(big.Rat).SetFrac(
 				new(big.Int).SetUint64(counter.amount),
 				new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(counter.decimals)), nil),
 			)
 			tmp := new(big.Rat).Quo(counterF, tokQty)
 			priceUSD, _ = tmp.Float64()
+			dbg(ctx, "[price] sig=%s: STABLE pair → priceUSD≈%.10f", ft.Signature.String(), priceUSD)
 		case isSOL:
-			// need SOL/USD for that minute
 			solUSD, err := cache.getAtUnix(ctx, bt)
 			if err != nil || solUSD <= 0 {
-				// cannot compute USD price; keep as zero
+				dbg(ctx, "[price] sig=%s: SOLUSD lookup failed (t=%d) err=%v", ft.Signature.String(), bt, err)
 				break
 			}
-			// USD per token = (SOL per token) * (SOL/USD)
 			if priceSOL == nil {
 				lamports := new(big.Rat).SetFrac(
 					new(big.Int).SetUint64(counter.amount),
@@ -241,8 +264,9 @@ func GetPricesAtSlot(
 			}
 			ps, _ := new(big.Rat).Set(priceSOL).Float64()
 			priceUSD = ps * solUSD
+			dbg(ctx, "[price] sig=%s: SOL pair → SOLUSD=%.6f priceUSD≈%.10f", ft.Signature.String(), solUSD, priceUSD)
 		default:
-			// unsupported counter (neither SOL nor stable); skip pricing
+			dbg(ctx, "[price] sig=%s: counter not SOL/USDC/USDT (%s); skip", ft.Signature.String(), counter.mint)
 			continue
 		}
 
@@ -257,7 +281,7 @@ func GetPricesAtSlot(
 			priceSOLF = 0
 		}
 
-		points = append(points, PricePoint{
+		pp := PricePoint{
 			Signature:        ft.Signature.String(),
 			Slot:             slot,
 			BlockTime:        bt,
@@ -280,9 +304,12 @@ func GetPricesAtSlot(
 			SOLAmountBase:   solBase,
 			TokenDecimals:   target.decimals,
 			Note:            "derived from swapInfo; supports SOL/USDC/USDT counters; USD computed",
-		})
+		}
+		dbg(ctx, "[price] sig=%s: point kept: %s", ft.Signature.String(), PrettyPrice(pp))
+		points = append(points, pp)
 	}
 
+	dbg(ctx, "[price] slot=%d: produced %d point(s)", slot, len(points))
 	return points, nil
 }
 

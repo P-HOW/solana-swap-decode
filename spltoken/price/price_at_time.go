@@ -11,7 +11,6 @@ import (
 )
 
 // estimateBackoffSlotsForDays computes how many *slots* roughly occur over `days`,
-// using recent performance samples when available (fallback ~2.5 slots/sec).
 func estimateBackoffSlotsForDays(ctx context.Context, client *rpc.Client, days float64) int {
 	if days <= 0 {
 		return 0
@@ -42,19 +41,6 @@ func estimateBackoffSlotsForDays(ctx context.Context, client *rpc.Client, days f
 	return slots
 }
 
-// GetTokenUSDPriceAtUnix computes the USD price for 1 unit of `targetMint` at UNIX timestamp (seconds).
-// Steps:
-//  1. Find closest slot to t using SlotAtClosest (fast bracketing).
-//  2. Gather swap-derived points at that slot; if empty, scan earlier slots (backoff) up to ~8d of slots.
-//  3. Convert each point to USD (USDC/USDT 1:1; SOL via Binance minute close).
-//  4. Return VWAP (log-fenced) over USD prices weighted by USD notional of the counter/base leg.
-//
-// Params (defaults applied when <=0):
-//   - backoffSlots: how many earlier slots to scan if initially empty (default ≈ slots in past 8 days)
-//   - fenceR: log-fence parameter r (>1) (default 1.5)
-//   - minWUSD: minimum USD notional to count as dust (default 1e-6)
-//
-// Note: Backoff stops at the **first slot** that yields any priceable swaps (no minPoints threshold).
 func GetTokenUSDPriceAtUnix(
 	ctx context.Context,
 	client *rpc.Client,
@@ -71,7 +57,6 @@ func GetTokenUSDPriceAtUnix(
 	if tUnix <= 0 {
 		return 0, 0, 0, false, errors.New("invalid timestamp")
 	}
-	// Default backoff: scan up to ~8 days worth of *slots* into the past.
 	if backoffSlots <= 0 {
 		backoffSlots = estimateBackoffSlotsForDays(ctx, client, 8.0)
 	}
@@ -82,34 +67,35 @@ func GetTokenUSDPriceAtUnix(
 		minWUSD = 1e-6
 	}
 
-	// 1) time → closest slot
 	best, _, err := SlotAtClosest(ctx, client, tUnix, 4096)
 	if err != nil {
 		return 0, 0, 0, false, err
 	}
+	dbg(ctx, "[vwap] target=%s unix=%d → closest slot=%d (backoff cap ~%d)", targetMint.String(), tUnix, best, backoffSlots)
 
-	// 2) collect price points; stop at the first slot that yields any priceable swaps
 	values := make([]float64, 0, 8)
 	weights := make([]float64, 0, 8)
 
-	addPoints := func(ps []PricePoint) {
+	addPoints := func(ps []PricePoint, slot uint64) {
+		dbg(ctx, "[vwap] slot=%d: checking %d point(s)", slot, len(ps))
 		for _, p := range ps {
 			if p.PriceUSD <= 0 || p.TargetQtyFloat <= 0 {
+				dbg(ctx, "[vwap]   drop sig=%s: priceUSD=%.10f qty=%.6f", p.Signature, p.PriceUSD, p.TargetQtyFloat)
 				continue
 			}
-			// Compute USD notional of the counter/base leg (weight).
 			var w float64
 			if p.BaseIsStable {
-				// baseUSD = baseAmount / 10^dec
 				w = float64(p.BaseAmountRaw) / math.Pow10(p.BaseDecimals)
+				dbg(ctx, "[vwap]   keep sig=%s: STABLE w=%.10f price=%.10f", p.Signature, w, p.PriceUSD)
 			} else if p.BaseIsSOL {
-				// Stay consistent with USD computation for SOL pairs:
-				// baseUSD ≈ PriceUSD * tokenQty
 				w = p.PriceUSD * p.TargetQtyFloat
+				dbg(ctx, "[vwap]   keep sig=%s: SOL w=%.10f price=%.10f", p.Signature, w, p.PriceUSD)
 			} else {
+				dbg(ctx, "[vwap]   drop sig=%s: base not SOL/USDC/USDT", p.Signature)
 				continue
 			}
 			if w <= 0 || math.IsNaN(w) || math.IsInf(w, 0) {
+				dbg(ctx, "[vwap]   drop sig=%s: invalid weight w=%.8f", p.Signature, w)
 				continue
 			}
 			values = append(values, p.PriceUSD)
@@ -119,7 +105,7 @@ func GetTokenUSDPriceAtUnix(
 
 	// Try the closest slot first.
 	if pts, err := GetPricesAtSlot(ctx, client, best, targetMint); err == nil && len(pts) > 0 {
-		addPoints(pts)
+		addPoints(pts, best)
 	}
 
 	// If still empty, walk backward until we find any priceable swaps or hit the cap.
@@ -131,31 +117,34 @@ func GetTokenUSDPriceAtUnix(
 		}
 		curr--
 
+		if scanned%5000 == 0 { // not too chatty
+			dbg(ctx, "[vwap] scanning back: curr=%d scanned=%d/%d", curr, scanned, backoffSlots)
+		}
+
 		pts, err := GetPricesAtSlot(ctx, client, curr, targetMint)
 		if err != nil {
-			// if slot is missing/pruned, skip
 			scanned++
 			continue
 		}
 		if len(pts) > 0 {
-			addPoints(pts)
-			// **Stop immediately** on first slot that provides priceable swaps.
+			dbg(ctx, "[vwap] first non-empty slot found at %d", curr)
+			addPoints(pts, curr)
 			break
 		}
 		scanned++
 	}
 
 	if len(values) == 0 {
+		dbg(ctx, "[vwap] no USD-priceable swaps found (scanned=%d)", scanned)
 		return 0, 0, 0, false, errors.New("no USD-priceable swaps found in the search window")
 	}
 
-	// 3) VWAP with log fence
 	v, k, sw, ok := VWAPWithLogFence(values, weights, fenceR, minWUSD)
+	dbg(ctx, "[vwap] result: v=%.10f kept=%d sumW=%.6f ok=%v", v, k, sw, ok)
 	return v, k, sw, ok, nil
 }
 
 // GetTokenUSDPriceAtTime convenience wrapper using time.Time (UTC assumed).
-// Uses the default backoff window (~8 days in slots) and stops at first priceable slot.
 func GetTokenUSDPriceAtTime(
 	ctx context.Context,
 	client *rpc.Client,
