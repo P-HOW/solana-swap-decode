@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	solanaswapgo "github.com/franco-bianco/solanaswap-go/solanaswap-go"
+	solanaswapgo "github.com/P-HOW/solana-swap-decode/solanaswap-go"
 
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"

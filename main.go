@@ -11,8 +11,10 @@ import (
 	"strings"
 	"time"
 
-	solanaswapgo "github.com/franco-bianco/solanaswap-go/solanaswap-go"
-	holder "github.com/franco-bianco/solanaswap-go/spltoken/holder"
+	solanaswapgo "github.com/P-HOW/solana-swap-decode/solanaswap-go"
+	holder "github.com/P-HOW/solana-swap-decode/spltoken/holder"
+	pricepkg "github.com/P-HOW/solana-swap-decode/spltoken/price"
+
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
 )
@@ -104,7 +106,21 @@ func main() {
     <button type="submit" style="padding: 8px 14px;">Count Holders</button>
   </form>
 
-  <p style="margin-top: 24px; color:#666;">This page issues GETs to <code>/parse?signature=...&pretty=1</code> and <code>/holders?mint=...&pretty=1</code>.</p>
+  <h2 style="margin:32px 0 8px;">Token USD Price (at unix time)</h2>
+  <form action="/price" method="get">
+    <label>Mint Address<br>
+      <input name="mint" style="width: 100%; padding: 8px;" placeholder="Enter mint address (base58)">
+    </label>
+    <label>Unix Timestamp (seconds)<br>
+      <input name="t" style="width: 100%; padding: 8px;" placeholder="e.g. 1731009600">
+    </label>
+    <div style="margin: 12px 0;">
+      <label><input type="checkbox" name="pretty" value="1" checked> pretty</label>
+    </div>
+    <button type="submit" style="padding: 8px 14px;">Get Price</button>
+  </form>
+
+  <p style="margin-top: 24px; color:#666;">This page issues GETs to <code>/parse?signature=...&pretty=1</code>, <code>/holders?mint=...&pretty=1</code>, and <code>/price?mint=...&t=...&pretty=1</code>.</p>
 </div>
 `))
 	})
@@ -239,6 +255,118 @@ func main() {
 			resp.ProgramUsed = res.ProgramUsed.String()
 		}
 		writeJSONMaybePretty(w, http.StatusOK, resp, pretty)
+	})
+
+	// ---- NEW: Price endpoint (GET or POST) ----
+	type priceReq struct {
+		Mint string `json:"mint"`
+		T    int64  `json:"t"` // unix seconds
+		// Optional overrides (kept for future/debug; defaulting handled inside the library)
+		BackoffSlots int     `json:"backoffSlots,omitempty"`
+		FenceR       float64 `json:"fenceR,omitempty"`
+		MinWUSD      float64 `json:"minWUSD,omitempty"`
+	}
+	type priceResp struct {
+		Mint      string  `json:"mint"`
+		T         int64   `json:"t"`
+		PriceUSD  float64 `json:"priceUSD"`
+		Kept      int     `json:"kept"`
+		SumW      float64 `json:"sumW"`
+		Ok        bool    `json:"ok"`
+		Error     string  `json:"error,omitempty"`
+		ErrorInfo string  `json:"details,omitempty"`
+	}
+
+	http.HandleFunc("/price", func(w http.ResponseWriter, r *http.Request) {
+		pretty := r.URL.Query().Get("pretty") == "1" || r.URL.Query().Get("pretty") == "true"
+
+		var req priceReq
+		switch r.Method {
+		case http.MethodPost:
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeJSONMaybePretty(w, http.StatusBadRequest, apiError{Error: "bad_request", Details: "invalid JSON body"}, pretty)
+				return
+			}
+		case http.MethodGet:
+			req.Mint = strings.TrimSpace(r.URL.Query().Get("mint"))
+			tStr := strings.TrimSpace(r.URL.Query().Get("t"))
+			if tStr != "" {
+				if tVal, err := strconv.ParseInt(tStr, 10, 64); err == nil {
+					req.T = tVal
+				}
+			}
+			// Optional overrides if provided
+			if v := strings.TrimSpace(r.URL.Query().Get("backoff")); v != "" {
+				if n, err := strconv.Atoi(v); err == nil {
+					req.BackoffSlots = n
+				}
+			}
+			if v := strings.TrimSpace(r.URL.Query().Get("r")); v != "" {
+				if f, err := strconv.ParseFloat(v, 64); err == nil {
+					req.FenceR = f
+				}
+			}
+			if v := strings.TrimSpace(r.URL.Query().Get("minw")); v != "" {
+				if f, err := strconv.ParseFloat(v, 64); err == nil {
+					req.MinWUSD = f
+				}
+			}
+		default:
+			writeJSONMaybePretty(w, http.StatusMethodNotAllowed, apiError{Error: "method_not_allowed"}, pretty)
+			return
+		}
+
+		if req.Mint == "" || req.T <= 0 {
+			writeJSONMaybePretty(w, http.StatusBadRequest, apiError{Error: "bad_request", Details: "expect mint=<base58> and t=<unix-seconds>"}, pretty)
+			return
+		}
+
+		// Validate/parse the mint pubkey (no panic)
+		var mintPK solana.PublicKey
+		if pk, err := solana.PublicKeyFromBase58(req.Mint); err == nil {
+			mintPK = pk
+		} else {
+			writeJSONMaybePretty(w, http.StatusBadRequest, apiError{Error: "bad_request", Details: "invalid mint (base58)"}, pretty)
+			return
+		}
+
+		// Per-request timeout (same as other endpoints)
+		ctx, cancel := context.WithTimeout(r.Context(), rpcTimeout)
+		defer cancel()
+
+		// Call price utility; defaults applied inside when <=0
+		v, kept, sumW, ok, err := pricepkg.GetTokenUSDPriceAtUnix(
+			ctx,
+			client,
+			mintPK,
+			req.T,
+			req.BackoffSlots,
+			req.FenceR,
+			req.MinWUSD,
+		)
+
+		if err != nil {
+			writeJSONMaybePretty(w, http.StatusOK, priceResp{
+				Mint:      req.Mint,
+				T:         req.T,
+				PriceUSD:  0,
+				Kept:      kept,
+				SumW:      sumW,
+				Ok:        ok,
+				Error:     "price_error",
+				ErrorInfo: err.Error(),
+			}, pretty)
+			return
+		}
+
+		writeJSONMaybePretty(w, http.StatusOK, priceResp{
+			Mint:     req.Mint,
+			T:        req.T,
+			PriceUSD: v,
+			Kept:     kept,
+			SumW:     sumW,
+			Ok:       ok,
+		}, pretty)
 	})
 
 	// HTTP server settings

@@ -1,4 +1,4 @@
-module github.com/franco-bianco/solanaswap-go
+module github.com/P-HOW/solana-swap-decode
 
 go 1.23.2
 
