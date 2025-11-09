@@ -118,6 +118,7 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 	}
 
 	// 0) Edge: now slot/time
+	dbg(ctx, "[slot] locating closest slot to unix=%d (maxProbes=%d)", targetUnix, maxProbes)
 	nowSlot, err := client.GetSlot(ctx, rpc.CommitmentFinalized)
 	if err != nil {
 		return 0, nil, err
@@ -138,6 +139,7 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 
 	// 1) Estimate slots/sec and an initial guess near target time.
 	guess, sps := estimateSlotGuess(ctx, client, nowSlot, btNow, targetUnix)
+	dbg(ctx, "[slot] initial guess=%d using sps≈%.3f", guess, sps)
 
 	// 2) Build an initial window around guess using a % of lookback.
 	lookbackSec := float64(btNow - targetUnix)
@@ -324,6 +326,7 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 	}
 
 	// 5) Binary search within [lo, hi].
+	dbg(ctx, "[slot] bracketed in [%d, %d]; entering binary search", lo, hi)
 	for iter := 0; lo+1 < hi && iter < 64 && maxProbes > 0; iter++ {
 		mid := lo + (hi-lo)/2
 		tMid, okMid := getBT(mid)
@@ -367,13 +370,16 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 	dLo := absI64(tLo - targetUnix)
 	dHi := absI64(tHi - targetUnix)
 	if dLo < dHi {
+		dbg(ctx, "[slot] done: best=%d (Δ=%ds vs target)", lo, dLo)
 		return lo, nil, nil
 	}
 	if dHi < dLo {
+		dbg(ctx, "[slot] done: best=%d (Δ=%ds vs target)", hi, dHi)
 		return hi, nil, nil
 	}
 	res := lo
 	ti := hi
+	dbg(ctx, "[slot] done: tie between %d and %d (equal distance); choose %d and report tie", lo, hi, res)
 	return res, &ti, nil
 }
 

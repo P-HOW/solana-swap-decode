@@ -66,14 +66,20 @@ func Test_GetTokenUSDPriceAtTime_Live(t *testing.T) {
 	}
 	client := rpc.New(rpcURL)
 
-	// Pick a recent time in the past to ensure data availability.
-	ts := time.Now().UTC().Add(-30000 * time.Minute)
+	// Intentionally pick ~30 days ago to exercise the backoff cap (~8 days).
+	ts := time.Now().UTC().Add(-200 * time.Minute) // ~30d
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
+	defer cancel()
+	// Enable debug logs to see slot search + backoff scanning progress.
+	ctx = WithPriceDebug(ctx, t.Logf)
 
 	// Use DBONK (example) – replace with any liquid token for real checks.
 	mint := solana.MustPublicKeyFromBase58("Dz9mQ9NzkBcCsuGPFJ3r1bS4wgqKMHBPiVuniW8Mbonk")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
+	// Log planned backoff window (~8d) in slots so we can see the cap in output.
+	backoffCap := estimateBackoffSlotsForDays(ctx, client, 8.0)
+	t.Logf("[test] backoff cap (≈8 days) ~%d slots", backoffCap)
 
 	v, kept, sumW, ok, err := GetTokenUSDPriceAtTime(ctx, client, mint, ts)
 	if err != nil {

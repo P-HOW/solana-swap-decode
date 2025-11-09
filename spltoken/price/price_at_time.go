@@ -45,22 +45,22 @@ func estimateBackoffSlotsForDays(ctx context.Context, client *rpc.Client, days f
 // GetTokenUSDPriceAtUnix computes the USD price for 1 unit of `targetMint` at UNIX timestamp (seconds).
 // Steps:
 //  1. Find closest slot to t using SlotAtClosest (fast bracketing).
-//  2. Gather swap-derived points at that slot; if empty, scan a few slots backward as backoff.
+//  2. Gather swap-derived points at that slot; if empty, scan earlier slots (backoff) up to ~8d of slots.
 //  3. Convert each point to USD (USDC/USDT 1:1; SOL via Binance minute close).
 //  4. Return VWAP (log-fenced) over USD prices weighted by USD notional of the counter/base leg.
 //
 // Params (defaults applied when <=0):
 //   - backoffSlots: how many earlier slots to scan if initially empty (default ≈ slots in past 8 days)
-//   - minPoints: minimum observations to accept before stopping backoff (default 3)
 //   - fenceR: log-fence parameter r (>1) (default 1.5)
 //   - minWUSD: minimum USD notional to count as dust (default 1e-6)
+//
+// Note: Backoff stops at the **first slot** that yields any priceable swaps (no minPoints threshold).
 func GetTokenUSDPriceAtUnix(
 	ctx context.Context,
 	client *rpc.Client,
 	targetMint solana.PublicKey,
 	tUnix int64,
 	backoffSlots int,
-	minPoints int,
 	fenceR float64,
 	minWUSD float64,
 ) (vwapUSD float64, kept int, sumW float64, ok bool, err error) {
@@ -75,9 +75,6 @@ func GetTokenUSDPriceAtUnix(
 	if backoffSlots <= 0 {
 		backoffSlots = estimateBackoffSlotsForDays(ctx, client, 8.0)
 	}
-	if minPoints <= 0 {
-		minPoints = 3
-	}
 	if fenceR <= 1.0 || math.IsNaN(fenceR) {
 		fenceR = 1.5
 	}
@@ -91,9 +88,9 @@ func GetTokenUSDPriceAtUnix(
 		return 0, 0, 0, false, err
 	}
 
-	// 2) collect price points from best + (optional) a few earlier slots
-	values := make([]float64, 0, 16)
-	weights := make([]float64, 0, 16)
+	// 2) collect price points; stop at the first slot that yields any priceable swaps
+	values := make([]float64, 0, 8)
+	weights := make([]float64, 0, 8)
 
 	addPoints := func(ps []PricePoint) {
 		for _, p := range ps {
@@ -106,7 +103,7 @@ func GetTokenUSDPriceAtUnix(
 				// baseUSD = baseAmount / 10^dec
 				w = float64(p.BaseAmountRaw) / math.Pow10(p.BaseDecimals)
 			} else if p.BaseIsSOL {
-				// Keep consistency with USD computation for SOL pairs:
+				// Stay consistent with USD computation for SOL pairs:
 				// baseUSD ≈ PriceUSD * tokenQty
 				w = p.PriceUSD * p.TargetQtyFloat
 			} else {
@@ -117,30 +114,33 @@ func GetTokenUSDPriceAtUnix(
 			}
 			values = append(values, p.PriceUSD)
 			weights = append(weights, w)
-			// allow more points; backoff loop stops once minPoints reached
 		}
 	}
 
-	// Always try the best slot first.
+	// Try the closest slot first.
 	if pts, err := GetPricesAtSlot(ctx, client, best, targetMint); err == nil && len(pts) > 0 {
 		addPoints(pts)
 	}
 
-	// Backoff if needed: scan earlier slots, capped by backoffSlots (~8 days).
+	// If still empty, walk backward until we find any priceable swaps or hit the cap.
 	scanned := 0
 	curr := best
-	for len(values) < minPoints && scanned < backoffSlots {
+	for len(values) == 0 && scanned < backoffSlots {
 		if curr == 0 {
 			break
 		}
 		curr--
+
 		pts, err := GetPricesAtSlot(ctx, client, curr, targetMint)
 		if err != nil {
-			// if a slot is missing or pruned, just skip
+			// if slot is missing/pruned, skip
+			scanned++
 			continue
 		}
 		if len(pts) > 0 {
 			addPoints(pts)
+			// **Stop immediately** on first slot that provides priceable swaps.
+			break
 		}
 		scanned++
 	}
@@ -155,12 +155,12 @@ func GetTokenUSDPriceAtUnix(
 }
 
 // GetTokenUSDPriceAtTime convenience wrapper using time.Time (UTC assumed).
-// Uses the default backoff window (~8 days in slots).
+// Uses the default backoff window (~8 days in slots) and stops at first priceable slot.
 func GetTokenUSDPriceAtTime(
 	ctx context.Context,
 	client *rpc.Client,
 	targetMint solana.PublicKey,
 	t time.Time,
 ) (float64, int, float64, bool, error) {
-	return GetTokenUSDPriceAtUnix(ctx, client, targetMint, t.UTC().Unix(), 0, 3, 1.5, 1e-6)
+	return GetTokenUSDPriceAtUnix(ctx, client, targetMint, t.UTC().Unix(), 0, 1.5, 1e-6)
 }
