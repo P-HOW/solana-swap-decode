@@ -3,6 +3,7 @@ package solanaswapgo
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	ag_binary "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
@@ -183,23 +184,40 @@ func (p *Parser) extractSPLDecimals() error {
 }
 
 // parseJupiterEvents aggregates all legs from Jupiter events into one SwapInfo.
+//
+// New logic: compute net per-mint flow across legs and select:
+//   - TokenInMint  = mint with largest negative net (spent by the route)
+//   - TokenOutMint = mint with largest positive net (received by the route)
+//
+// Amounts are the total *per-direction* sums for the chosen mints.
+// This remains backward-compatible for single-hop routes.
 func parseJupiterEvents(events []SwapData) (*SwapInfo, error) {
 	if len(events) == 0 {
 		return nil, fmt.Errorf("no events provided")
 	}
 
-	var (
-		have              bool
-		totalIn, totalOut uint64
-		inMint, outMint   solana.PublicKey
-		inDec, outDec     uint8
-	)
+	type agg struct {
+		inSum, outSum uint64
+		dec           uint8
+	}
+	perMint := make(map[string]*agg)
+
+	ensure := func(m string, dec uint8) *agg {
+		if a, ok := perMint[m]; ok {
+			// Preserve a known non-zero decimals if present
+			if a.dec == 0 && dec != 0 {
+				a.dec = dec
+			}
+			return a
+		}
+		perMint[m] = &agg{dec: dec}
+		return perMint[m]
+	}
 
 	for _, event := range events {
 		if event.Type != JUPITER {
 			continue
 		}
-
 		var leg JupiterSwapEventData
 		raw, err := json.Marshal(event.Data)
 		if err != nil {
@@ -209,35 +227,68 @@ func parseJupiterEvents(events []SwapData) (*SwapInfo, error) {
 			return nil, fmt.Errorf("failed to unmarshal Jupiter event data: %v", err)
 		}
 
-		if !have {
-			inMint, outMint = leg.InputMint, leg.OutputMint
-			inDec, outDec = leg.InputMintDecimals, leg.OutputMintDecimals
-			have = true
-		}
+		inAgg := ensure(leg.InputMint.String(), leg.InputMintDecimals)
+		outAgg := ensure(leg.OutputMint.String(), leg.OutputMintDecimals)
 
-		// In practice, all legs share the same route-level input/output mints.
-		// If a leg differs (edge case), we only sum amounts that match the
-		// route-level mints we captured first.
-		if leg.InputMint.Equals(inMint) {
-			totalIn += leg.InputAmount
-		}
-		if leg.OutputMint.Equals(outMint) {
-			totalOut += leg.OutputAmount
-		}
+		inAgg.inSum += leg.InputAmount
+		outAgg.outSum += leg.OutputAmount
 	}
 
-	if !have {
-		return nil, fmt.Errorf("no valid Jupiter swaps found")
+	if len(perMint) < 2 {
+		return nil, fmt.Errorf("not enough distinct mints in Jupiter events")
+	}
+
+	// Compute net = outSum - inSum and pick extremes
+	type netRow struct {
+		mint string
+		dec  uint8
+		in   uint64
+		out  uint64
+		net  int64
+	}
+	rows := make([]netRow, 0, len(perMint))
+	for m, a := range perMint {
+		rows = append(rows, netRow{
+			mint: m,
+			dec:  a.dec,
+			in:   a.inSum,
+			out:  a.outSum,
+			net:  int64(a.outSum) - int64(a.inSum),
+		})
+	}
+
+	// Largest positive net = final out; most negative = true input
+	sort.Slice(rows, func(i, j int) bool { return rows[i].net > rows[j].net })
+	outRow := rows[0] // max net
+	sort.Slice(rows, func(i, j int) bool { return rows[i].net < rows[j].net })
+	inRow := rows[0] // min net
+
+	// Safety: ensure they are different mints
+	if inRow.mint == outRow.mint {
+		// fallback to a stable heuristic: pick different mints if possible
+		names := make([]string, 0, len(perMint))
+		for m := range perMint {
+			names = append(names, m)
+		}
+		sort.Strings(names)
+		if len(names) >= 2 {
+			inRow.mint = names[0]
+			outRow.mint = names[len(names)-1]
+			inRow.in = perMint[inRow.mint].inSum
+			inRow.dec = perMint[inRow.mint].dec
+			outRow.out = perMint[outRow.mint].outSum
+			outRow.dec = perMint[outRow.mint].dec
+		}
 	}
 
 	swapInfo := &SwapInfo{
 		AMMs:             []string{string(JUPITER)},
-		TokenInMint:      inMint,
-		TokenInAmount:    totalIn,
-		TokenInDecimals:  inDec,
-		TokenOutMint:     outMint,
-		TokenOutAmount:   totalOut,
-		TokenOutDecimals: outDec,
+		TokenInMint:      solana.MustPublicKeyFromBase58(inRow.mint),
+		TokenInAmount:    inRow.in,
+		TokenInDecimals:  inRow.dec,
+		TokenOutMint:     solana.MustPublicKeyFromBase58(outRow.mint),
+		TokenOutAmount:   outRow.out,
+		TokenOutDecimals: outRow.dec,
 	}
 	return swapInfo, nil
 }
