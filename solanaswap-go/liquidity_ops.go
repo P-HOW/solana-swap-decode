@@ -114,12 +114,20 @@ var addAnchors = func() map[[8]byte]struct{} {
 	return m
 }()
 
+// Expanded to catch Meteora DAMM v2 / pools variants commonly seen in the wild.
 var removeAnchors = func() map[[8]byte]struct{} {
 	names := []string{
 		"remove_liquidity",
+		"remove_liquidity_by_strategy",
+		"remove_liquidity_by_strategy2",
 		"decrease_liquidity",
 		"decrease_liquidity_v2",
 		"close_position",
+		"withdraw",
+		"withdraw_liquidity",
+		"withdraw_one",
+		"withdraw_one_token",
+		"claim_and_withdraw",
 	}
 	m := make(map[[8]byte]struct{}, len(names))
 	for _, n := range names {
@@ -190,18 +198,29 @@ func (p *Parser) hasAnchorPrefix(prefixes map[[8]byte]struct{}, ammOnly bool) bo
 	return false
 }
 
-// Meteora DLMM specific: treat mere presence as a weak remove-signal fallback (like JS)
-func (p *Parser) hasMeteoraDLMM() bool {
-	// scan outer+inner for DLMM program id
+// Meteora-specific: broader weak remove-signal fallback (DLMM + DAMM v2 + DBC + Pools + main)
+func (p *Parser) hasMeteoraRemoveContext() bool {
+	// outer
 	for _, ix := range p.txInfo.Message.Instructions {
-		if p.allAccountKeys[ix.ProgramIDIndex].Equals(METEORA_DLMM_PROGRAM_ID) {
+		pid := p.allAccountKeys[ix.ProgramIDIndex]
+		if pid.Equals(METEORA_DLMM_PROGRAM_ID) ||
+			pid.Equals(METEORA_DAMM_V2_PROGRAM_ID) ||
+			pid.Equals(METEORA_DBC_PROGRAM_ID) ||
+			pid.Equals(METEORA_POOLS_PROGRAM_ID) ||
+			pid.Equals(METEORA_PROGRAM_ID) {
 			return true
 		}
 	}
+	// inner
 	for _, inner := range p.txMeta.InnerInstructions {
 		for _, ri := range inner.Instructions {
 			ix := p.convertRPCToSolanaInstruction(ri)
-			if p.allAccountKeys[ix.ProgramIDIndex].Equals(METEORA_DLMM_PROGRAM_ID) {
+			pid := p.allAccountKeys[ix.ProgramIDIndex]
+			if pid.Equals(METEORA_DLMM_PROGRAM_ID) ||
+				pid.Equals(METEORA_DAMM_V2_PROGRAM_ID) ||
+				pid.Equals(METEORA_DBC_PROGRAM_ID) ||
+				pid.Equals(METEORA_POOLS_PROGRAM_ID) ||
+				pid.Equals(METEORA_PROGRAM_ID) {
 				return true
 			}
 		}
@@ -232,8 +251,8 @@ func (p *Parser) DetectLiquidityOp() LiquidityOp {
 		return LiquidityRemove
 	}
 
-	// 4) Fallback: Meteora DLMM present → treat as remove (parity with JS fallback)
-	if p.hasMeteoraDLMM() {
+	// 4) Fallback: any Meteora family signal → treat as remove (parity with JS fallback)
+	if p.hasMeteoraRemoveContext() {
 		return LiquidityRemove
 	}
 
