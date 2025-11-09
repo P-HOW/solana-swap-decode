@@ -116,6 +116,7 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 	if maxProbes <= 0 {
 		maxProbes = 1024
 	}
+	const minuteSlack = int64(60) // NEW: if we're within 60s, accept immediately
 
 	// 0) Edge: now slot/time
 	dbg(ctx, "[slot] locating closest slot to unix=%d (maxProbes=%d)", targetUnix, maxProbes)
@@ -139,6 +140,9 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 
 	// 1) Estimate slots/sec and an initial guess near target time.
 	guess, sps := estimateSlotGuess(ctx, client, nowSlot, btNow, targetUnix)
+	DBGdt := func(slot uint64, t int64) {
+		dbg(ctx, "[slot] candidate slot=%d |Δ|=%ds vs target", slot, absI64(t-targetUnix))
+	}
 	dbg(ctx, "[slot] initial guess=%d using sps≈%.3f", guess, sps)
 
 	// 2) Build an initial window around guess using a % of lookback.
@@ -178,6 +182,14 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 
 	// 3) Try to resolve guess time (may be nil on pruned RPCs).
 	tGuess, okGuess := getBT(guess)
+	if okGuess {
+		DBGdt(guess, tGuess)
+		// NEW: if guess already within 60s, accept immediately
+		if absI64(tGuess-targetUnix) <= minuteSlack {
+			dbg(ctx, "[slot] guess within 60s (Δ=%ds); returning %d", absI64(tGuess-targetUnix), guess)
+			return guess, nil, nil
+		}
+	}
 	if !okGuess {
 		// Light local nudge to find a nearby slot with time.
 		for _, step := range []uint64{50, 200, 1000, 5000} {
@@ -185,6 +197,11 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 				if tg, ok := getBT(guess - step); ok {
 					tGuess, okGuess = tg, true
 					guess = guess - step
+					DBGdt(guess, tGuess)
+					if absI64(tGuess-targetUnix) <= minuteSlack {
+						dbg(ctx, "[slot] nudged guess within 60s (Δ=%ds); returning %d", absI64(tGuess-targetUnix), guess)
+						return guess, nil, nil
+					}
 					break
 				}
 			}
@@ -192,6 +209,11 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 				if tg, ok := getBT(guess + step); ok {
 					tGuess, okGuess = tg, true
 					guess = guess + step
+					DBGdt(guess, tGuess)
+					if absI64(tGuess-targetUnix) <= minuteSlack {
+						dbg(ctx, "[slot] nudged guess within 60s (Δ=%ds); returning %d", absI64(tGuess-targetUnix), guess)
+						return guess, nil, nil
+					}
 					break
 				}
 			}
@@ -210,12 +232,25 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 		// Try to get times at lo/hi; if nil, nudge locally a bit.
 		if tt, ok := getBT(lo); ok {
 			tLo, tLoOK = tt, true
+			DBGdt(lo, tLo)
+			// NEW: accept if within 60s
+			if absI64(tLo-targetUnix) <= minuteSlack {
+				dbg(ctx, "[slot] lo within 60s (Δ=%ds); returning %d", absI64(tLo-targetUnix), lo)
+				best = lo
+				return true
+			}
 		} else {
 			for _, step := range []uint64{1_000, 5_000, 25_000} {
 				if lo+step <= hi {
 					if tt, ok := getBT(lo + step); ok {
 						lo += step
 						tLo, tLoOK = tt, true
+						DBGdt(lo, tLo)
+						if absI64(tLo-targetUnix) <= minuteSlack {
+							dbg(ctx, "[slot] lo+nudge within 60s (Δ=%ds); returning %d", absI64(tLo-targetUnix), lo)
+							best = lo
+							return true
+						}
 						break
 					}
 				}
@@ -223,12 +258,24 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 		}
 		if tt, ok := getBT(hi); ok {
 			tHi, tHiOK = tt, true
+			DBGdt(hi, tHi)
+			if absI64(tHi-targetUnix) <= minuteSlack {
+				dbg(ctx, "[slot] hi within 60s (Δ=%ds); returning %d", absI64(tHi-targetUnix), hi)
+				best = hi
+				return true
+			}
 		} else {
 			for _, step := range []uint64{1_000, 5_000, 25_000} {
 				if hi > lo+step {
 					if tt, ok := getBT(hi - step); ok {
 						hi -= step
 						tHi, tHiOK = tt, true
+						DBGdt(hi, tHi)
+						if absI64(tHi-targetUnix) <= minuteSlack {
+							dbg(ctx, "[slot] hi-nudge within 60s (Δ=%ds); returning %d", absI64(tHi-targetUnix), hi)
+							best = hi
+							return true
+						}
 						break
 					}
 				}
@@ -258,6 +305,10 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 		if !tLoOK || !tHiOK {
 			if !expand(spanSlots) {
 				break
+			}
+			// expand() may already set best and early-return conditionally; if so, bail out now.
+			if best != 0 && (absI64(tLo-targetUnix) <= minuteSlack || absI64(tHi-targetUnix) <= minuteSlack) {
+				return best, nil, nil
 			}
 		}
 
@@ -350,6 +401,13 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 			}
 			continue
 		}
+
+		// NEW: accept as soon as mid is within 60s
+		if d := absI64(tMid - targetUnix); d <= minuteSlack {
+			dbg(ctx, "[slot] mid within 60s at %d (Δ=%ds); returning early", mid, d)
+			return mid, nil, nil
+		}
+
 		if tMid == targetUnix {
 			best = mid
 			if mid+1 <= hi {
@@ -369,6 +427,17 @@ func SlotAtClosest(ctx context.Context, client *rpc.Client, targetUnix int64, ma
 
 	dLo := absI64(tLo - targetUnix)
 	dHi := absI64(tHi - targetUnix)
+
+	// NEW: final pass — if either bound is within 60s, prefer the closer and return
+	if dLo <= minuteSlack || dHi <= minuteSlack {
+		if dLo <= dHi {
+			dbg(ctx, "[slot] done (<=60s): best=%d (Δ=%ds vs target)", lo, dLo)
+			return lo, nil, nil
+		}
+		dbg(ctx, "[slot] done (<=60s): best=%d (Δ=%ds vs target)", hi, dHi)
+		return hi, nil, nil
+	}
+
 	if dLo < dHi {
 		dbg(ctx, "[slot] done: best=%d (Δ=%ds vs target)", lo, dLo)
 		return lo, nil, nil
