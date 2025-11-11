@@ -1954,3 +1954,18 @@ Timeout per request: 599s | Retries: 3 | Pacing: 0.1s
 
 Process finished with exit code 0 (usage 433446)
 
+/home/oliveira/PycharmProjects/on-chain-master/.venv/bin/python /home/oliveira/PycharmProjects/on-chain-master/solana/cost_optimization.py 
+Discovering slot range…
+Connectivity self-test…
+  ✓ getVersion -> {'feature-set': 3604001754, 'solana-core': '3.0.10'}
+  ✓ getHealth -> ok
+  ✓ getSlot -> 379424907
+Time now:            2025-11-11 17:48:21+00:00
+Cutoff (~2 months):  2025-09-12 17:48:21+00:00
+First available:     slot 0
+Start slot found:    366376211 (time: 2025-09-12 17:48:21+00:00)
+Latest slot:         379424907
+Total blocks to stream: 13,048,697
+
+[██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░] 653,897/13,048,697 (  5.0%) | ETA 70h05m51s | Rate 49.1 blk/s
+Process finished with exit code 137 (interrupted by signal 9:SIGKILL)
